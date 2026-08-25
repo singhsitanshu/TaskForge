@@ -8,6 +8,8 @@ TaskForge uses paired, ordered PostgreSQL migration files:
 - `000002_first_worker_claim.down.sql` restores the initial lease-shaped schema.
 - `000003_pre_tf005_remediation.up.sql` adds worker instance identity and the priority claim index.
 - `000003_pre_tf005_remediation.down.sql` removes those remediation objects.
+- `000004_task_leases.up.sql` canonicalizes task leases and adds the expired-running-task index.
+- `000004_task_leases.down.sql` restores the pre-TF-007 lease scaffolding.
 
 Apply or roll back the current migration against the Compose PostgreSQL service:
 

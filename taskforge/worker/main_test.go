@@ -74,3 +74,19 @@ func TestResolveHeartbeatConfiguration(t *testing.T) {
 		t.Fatalf("unexpected heartbeat configuration: %#v", configuration)
 	}
 }
+
+func TestResolveLeaseConfiguration(t *testing.T) {
+	t.Setenv("WORKER_TASK_LEASE_DURATION", "500ms")
+	t.Setenv("WORKER_TASK_LEASE_RENEW_INTERVAL", "100ms")
+	t.Setenv("WORKER_TASK_LEASE_RENEW_TIMEOUT", "50ms")
+
+	configuration, err := resolveLeaseConfig()
+	if err != nil {
+		t.Fatalf("resolve lease configuration: %v", err)
+	}
+	if configuration.Duration != 500*time.Millisecond ||
+		configuration.RenewInterval != 100*time.Millisecond ||
+		configuration.RenewTimeout != 50*time.Millisecond {
+		t.Fatalf("unexpected lease configuration: %#v", configuration)
+	}
+}

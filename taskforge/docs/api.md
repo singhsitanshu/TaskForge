@@ -41,6 +41,8 @@ Cancellation is idempotent for an already `CANCELLED` task. Unknown tasks return
 
 This endpoint changes lifecycle state only. It does not execute tasks or implement worker behavior.
 
+Task responses expose `claimed_by_worker_id` and `lease_expires_at`. Both are non-null while a task has active or expired `RUNNING` ownership and are cleared on successful or failed completion. The API provides no lease-renewal endpoint; workers renew ownership directly through the repository protocol.
+
 ## List workers
 
 `GET /workers` returns an object with `items`, `limit`, and `offset`. Workers are ordered by registration time and ID, newest first. Each item includes:

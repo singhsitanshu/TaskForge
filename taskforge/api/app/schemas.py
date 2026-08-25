@@ -56,7 +56,7 @@ class TaskResponse(BaseModel):
     max_attempts: int
     attempt_count: int
     scheduled_at: datetime
-    leased_by_worker_id: UUID | None
+    claimed_by_worker_id: UUID | None
     lease_expires_at: datetime | None
     completed_at: datetime | None
     result: dict[str, Any] | None

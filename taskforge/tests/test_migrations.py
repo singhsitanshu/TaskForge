@@ -39,9 +39,13 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
     schema_name = f"migration_test_{uuid.uuid4().hex}"
 
     with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
-        connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
         try:
-            connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name)))
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
             connection.execute(UP_SQL)
 
             tables = {
@@ -73,6 +77,7 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 "000001_tasks_workers_attempts",
                 "000002_first_worker_claim",
                 "000003_pre_tf005_remediation",
+                "000004_task_leases",
             ]
 
             statuses = [
@@ -102,14 +107,12 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
             assert {
                 "tasks_queue_idempotency_key_idx",
                 "tasks_dispatch_idx",
-                "tasks_expired_lease_idx",
+                "tasks_running_lease_idx",
                 "tasks_status_updated_idx",
-                "tasks_lease_token_unique",
                 "tasks_claimed_worker_idx",
                 "tasks_claim_priority_idx",
                 "workers_available_idx",
                 "workers_name_idx",
-                "task_attempts_worker_active_idx",
                 "task_attempts_finished_idx",
             } <= indexes
 
@@ -160,13 +163,21 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                     INSERT INTO tasks (
                         task_type,
                         status,
-                        leased_by_worker_id,
-                        lease_token,
+                        claimed_by_worker_id,
                         lease_expires_at
                     )
-                    VALUES ('invalid-lease', 'QUEUED', %s, %s, now() + interval '1 minute')
+                    VALUES ('invalid-lease', 'QUEUED', %s, now() + interval '1 minute')
                     """,
-                    (worker_id, uuid.uuid4()),
+                    (worker_id,),
+                )
+
+            with pytest.raises(errors.CheckViolation):
+                connection.execute(
+                    """
+                    INSERT INTO tasks (task_type, status, claimed_by_worker_id)
+                    VALUES ('missing-running-lease', 'RUNNING', %s)
+                    """,
+                    (worker_id,),
                 )
 
             with pytest.raises(errors.CheckViolation):
@@ -177,20 +188,17 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                     """,
                 )
 
-            lease_token = uuid.uuid4()
             connection.execute(
                 """
                 INSERT INTO task_attempts (
                     task_id,
                     worker_id,
                     attempt_number,
-                    status,
-                    lease_token,
-                    lease_expires_at
+                    status
                 )
-                VALUES (%s, %s, 1, 'LEASED', %s, now() + interval '1 minute')
+                VALUES (%s, %s, 1, 'LEASED')
                 """,
-                (task_id, worker_id, lease_token),
+                (task_id, worker_id),
             )
 
             with pytest.raises(errors.UniqueViolation):
@@ -200,13 +208,11 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                         task_id,
                         worker_id,
                         attempt_number,
-                        status,
-                        lease_token,
-                        lease_expires_at
+                        status
                     )
-                    VALUES (%s, %s, 1, 'LEASED', %s, now() + interval '1 minute')
+                    VALUES (%s, %s, 1, 'LEASED')
                     """,
-                    (task_id, worker_id, uuid.uuid4()),
+                    (task_id, worker_id),
                 )
 
             with pytest.raises(errors.CheckViolation):
@@ -216,13 +222,11 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                         task_id,
                         worker_id,
                         attempt_number,
-                        status,
-                        lease_token,
-                        lease_expires_at
+                        status
                     )
-                    VALUES (%s, %s, 2, 'QUEUED', %s, now() + interval '1 minute')
+                    VALUES (%s, %s, 2, 'QUEUED')
                     """,
-                    (task_id, worker_id, uuid.uuid4()),
+                    (task_id, worker_id),
                 )
 
             with pytest.raises(errors.ForeignKeyViolation):
@@ -232,22 +236,28 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                         task_id,
                         worker_id,
                         attempt_number,
-                        status,
-                        lease_token,
-                        lease_expires_at
+                        status
                     )
-                    VALUES (%s, %s, 2, 'LEASED', %s, now() + interval '1 minute')
+                    VALUES (%s, %s, 2, 'LEASED')
                     """,
-                    (task_id, uuid.uuid4(), uuid.uuid4()),
+                    (task_id, uuid.uuid4()),
                 )
             connection.execute(DOWN_SQL)
 
             assert fetch_scalar(connection, "SELECT to_regclass('tasks')") is None
             assert fetch_scalar(connection, "SELECT to_regclass('workers')") is None
-            assert fetch_scalar(connection, "SELECT to_regclass('task_attempts')") is None
-            assert fetch_scalar(connection, "SELECT to_regclass('schema_migrations')") is None
+            assert (
+                fetch_scalar(connection, "SELECT to_regclass('task_attempts')") is None
+            )
+            assert (
+                fetch_scalar(connection, "SELECT to_regclass('schema_migrations')")
+                is None
+            )
             assert fetch_scalar(connection, "SELECT to_regtype('task_status')") is None
-            assert fetch_scalar(connection, "SELECT to_regprocedure('set_updated_at()')") is None
+            assert (
+                fetch_scalar(connection, "SELECT to_regprocedure('set_updated_at()')")
+                is None
+            )
         finally:
             # The happy path already exercises the complete rollback. On failure,
             # discard any open migration transaction and let the temporary schema
@@ -255,5 +265,7 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
             connection.rollback()
             connection.execute("SET search_path TO public")
             connection.execute(
-                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema_name))
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
             )

@@ -14,13 +14,15 @@ PostgreSQL defines the task lifecycle with the `task_status` enum.
 
 ## First worker transitions
 
-The first worker implements only `QUEUED -> RUNNING -> SUCCEEDED|FAILED`. Claiming creates exactly one `RUNNING` attempt and stores `claimed_by_worker_id`; completion updates the task and attempt in one transaction and clears the claim. The API permits only `QUEUED -> CANCELLED`; cancellation of any other state returns a conflict until worker cancellation signaling exists.
+The worker implements only `QUEUED -> RUNNING -> SUCCEEDED|FAILED`. Claiming creates exactly one `RUNNING` attempt, stores `claimed_by_worker_id`, and establishes a task lease. Completion updates the task and attempt in one transaction and clears both claim and lease. The API permits only `QUEUED -> CANCELLED`; cancellation of any other state returns a conflict until worker cancellation signaling exists.
 
 Retries and `RETRYING` transitions are not implemented. The worker does not create leases. Eligible queued tasks are claimed by priority descending, then creation time and task ID ascending.
 
 ## Database invariants
 
-- Lease metadata remains null in the current schema. A `RUNNING` task must have `claimed_by_worker_id`; every other status must clear it.
+- A `RUNNING` task must have `claimed_by_worker_id` and `lease_expires_at`; every other status must clear both.
+- Renewal and completion require the current worker, current attempt number, and `lease_expires_at > clock_timestamp()`. Equality is expired.
+- An expired task remains `RUNNING` with its attempt `RUNNING` in TF-007; no recovery transition is implemented.
 - `SUCCEEDED`, `FAILED`, and `CANCELLED` tasks must have `completed_at`. Non-terminal tasks must not.
 - `RETRYING` requires at least one remaining attempt.
 - Attempt numbers are positive and unique within a task.

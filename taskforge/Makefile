@@ -1,4 +1,4 @@
-.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-claims test-api test-migrations test-worker test-heartbeats
+.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-claims test-api test-migrations test-worker test-heartbeats test-leases
 
 build:
 	docker compose build
@@ -67,3 +67,7 @@ test-worker:
 
 test-heartbeats:
 	docker compose --profile test run --rm --build integration-tests pytest -q -s tests/test_worker_api.py tests/test_worker_heartbeat.py
+
+test-leases:
+	docker compose --profile test run --rm --build claim-tests
+	docker compose --profile test run --rm --build integration-tests pytest -q -s tests/test_worker_heartbeat.py

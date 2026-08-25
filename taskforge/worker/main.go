@@ -48,6 +48,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	leaseConfig, err := resolveLeaseConfig()
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -84,6 +88,9 @@ func run() error {
 		workerID,
 		identity.InstanceID,
 		pollInterval,
+		leaseConfig.Duration,
+		leaseConfig.RenewInterval,
+		leaseConfig.RenewTimeout,
 		log.Default(),
 	)
 	heartbeater := workerservice.NewHeartbeater(
@@ -251,6 +258,40 @@ func resolveHeartbeatConfig() (workerconfig.Heartbeat, error) {
 	}
 	if err := configuration.Validate(); err != nil {
 		return workerconfig.Heartbeat{}, err
+	}
+	return configuration, nil
+}
+
+func resolveLeaseConfig() (workerconfig.Lease, error) {
+	duration, err := durationEnv(
+		"WORKER_TASK_LEASE_DURATION",
+		workerconfig.DefaultTaskLeaseDuration,
+	)
+	if err != nil {
+		return workerconfig.Lease{}, err
+	}
+	renewInterval, err := durationEnv(
+		"WORKER_TASK_LEASE_RENEW_INTERVAL",
+		workerconfig.DefaultTaskLeaseRenewInterval,
+	)
+	if err != nil {
+		return workerconfig.Lease{}, err
+	}
+	renewTimeout, err := durationEnv(
+		"WORKER_TASK_LEASE_RENEW_TIMEOUT",
+		workerconfig.DefaultTaskLeaseRenewTimeout,
+	)
+	if err != nil {
+		return workerconfig.Lease{}, err
+	}
+
+	configuration := workerconfig.Lease{
+		Duration:      duration,
+		RenewInterval: renewInterval,
+		RenewTimeout:  renewTimeout,
+	}
+	if err := configuration.Validate(); err != nil {
+		return workerconfig.Lease{}, err
 	}
 	return configuration, nil
 }

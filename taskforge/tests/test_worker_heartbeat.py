@@ -83,6 +83,9 @@ def start_worker(schema_name: str, instance_id: str) -> subprocess.Popen:
             "WORKER_STALE_AFTER": "300ms",
             "WORKER_DEAD_AFTER": "700ms",
             "WORKER_HEARTBEAT_TIMEOUT": "50ms",
+            "WORKER_TASK_LEASE_DURATION": "500ms",
+            "WORKER_TASK_LEASE_RENEW_INTERVAL": "100ms",
+            "WORKER_TASK_LEASE_RENEW_TIMEOUT": "50ms",
             "HTTP_ADDR": "127.0.0.1:0",
         }
     )
@@ -172,6 +175,14 @@ def read_last_heartbeat(schema_name: str, instance_id: str):
         ).fetchone()[0]
 
 
+def read_task_lease(schema_name: str, task_id: str):
+    with schema_connection(schema_name) as connection:
+        return connection.execute(
+            "SELECT lease_expires_at FROM tasks WHERE id = %s",
+            (task_id,),
+        ).fetchone()[0]
+
+
 def test_heartbeats_continue_during_long_running_task(
     heartbeat_environment: tuple[str, TestClient],
 ) -> None:
@@ -183,27 +194,37 @@ def test_heartbeats_continue_during_long_running_task(
         registered_worker_id = worker_id(schema_name, instance_id, process)
         response = client.post(
             "/tasks",
-            json={"task_type": "test.sleep", "payload": {"duration_ms": 900}},
+            json={"task_type": "test.sleep", "payload": {"duration_ms": 1300}},
         )
         assert response.status_code == 201
         task_id = response.json()["id"]
         wait_for_task_status(client, task_id, "RUNNING", process)
 
         observed_heartbeats = {read_last_heartbeat(schema_name, instance_id)}
+        observed_leases = {read_task_lease(schema_name, task_id)}
         while True:
             task = client.get(f"/tasks/{task_id}").json()
             worker = client.get(f"/workers/{registered_worker_id}").json()
             observed_heartbeats.add(read_last_heartbeat(schema_name, instance_id))
+            if task["lease_expires_at"] is not None:
+                observed_leases.add(task["lease_expires_at"])
             assert worker["liveness"] == "ACTIVE"
             if task["status"] == "SUCCEEDED":
                 break
             time.sleep(0.04)
 
-        assert task["result"] == {"slept_ms": 900}
+        assert task["result"] == {"slept_ms": 1300}
+        assert task["lease_expires_at"] is None
+        assert task["claimed_by_worker_id"] is None
+        assert task["attempt_count"] == 1
         assert len(observed_heartbeats) >= 5
+        assert len(observed_leases) >= 5
         print(
-            "LONG_TASK duration_ms=900 interval_ms=100 "
-            f"heartbeats_observed={len(observed_heartbeats)} liveness=ACTIVE"
+            "LONG_TASK duration_ms=1300 heartbeat_interval_ms=100 "
+            "lease_duration_ms=500 lease_renew_interval_ms=100 "
+            f"heartbeats_observed={len(observed_heartbeats)} "
+            f"lease_expirations_observed={len(observed_leases)} "
+            "final_status=SUCCEEDED liveness=ACTIVE"
         )
     finally:
         output = stop_worker(process)
@@ -237,20 +258,105 @@ def test_stopped_worker_transitions_without_task_recovery(
 
     with schema_connection(schema_name) as connection:
         task_state = connection.execute(
-            "SELECT status::text, attempt_count FROM tasks WHERE id = %s",
+            "SELECT status::text, attempt_count, lease_expires_at < clock_timestamp() FROM tasks WHERE id = %s",
             (task_id,),
         ).fetchone()
         attempt_state = connection.execute(
             "SELECT status::text, finished_at FROM task_attempts WHERE task_id = %s",
             (task_id,),
         ).fetchone()
-    assert task_state == ("RUNNING", 1)
+    assert task_state == ("RUNNING", 1, True)
     assert attempt_state == ("RUNNING", None)
     print(
         "WORKER_STOP active=true "
         f"stale_after_seconds={stale_elapsed:.3f} dead_after_seconds={dead_elapsed:.3f} "
         "task_state=RUNNING attempt_state=RUNNING"
     )
+
+
+def test_lease_loss_does_not_stop_process_heartbeat_or_complete_task(
+    heartbeat_environment: tuple[str, TestClient],
+) -> None:
+    schema_name, client = heartbeat_environment
+    instance_id = f"lease-loss-{uuid.uuid4()}"
+    process = start_worker(schema_name, instance_id)
+    registered_worker_id = worker_id(schema_name, instance_id, process)
+    response = client.post(
+        "/tasks",
+        json={"task_type": "test.sleep", "payload": {"duration_ms": 2000}},
+    )
+    task_id = response.json()["id"]
+    wait_for_task_status(client, task_id, "RUNNING", process)
+
+    with schema_connection(schema_name) as connection:
+        connection.execute(
+            "UPDATE tasks SET lease_expires_at = clock_timestamp() - interval '1 millisecond' WHERE id = %s",
+            (task_id,),
+        )
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        with schema_connection(schema_name) as connection:
+            task_state = connection.execute(
+                "SELECT status::text, lease_expires_at < clock_timestamp() FROM tasks WHERE id = %s",
+                (task_id,),
+            ).fetchone()
+            attempt_state = connection.execute(
+                "SELECT status::text, finished_at FROM task_attempts WHERE task_id = %s",
+                (task_id,),
+            ).fetchone()
+        worker = client.get(f"/workers/{registered_worker_id}").json()
+        if task_state == ("RUNNING", True) and worker["liveness"] == "ACTIVE":
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("lease loss state was not observed")
+
+    time.sleep(0.25)
+    output = stop_worker(process)
+    assert process.returncode == 0, output
+    assert "event=task_lease_lost" in output
+    assert task_state == ("RUNNING", True)
+    assert attempt_state == ("RUNNING", None)
+    assert worker["liveness"] == "ACTIVE"
+    print(
+        "LEASE_LOSS worker_liveness=ACTIVE task=RUNNING attempt=RUNNING lease=EXPIRED"
+    )
+
+
+def test_hard_worker_crash_leaves_expired_running_ownership(
+    heartbeat_environment: tuple[str, TestClient],
+) -> None:
+    schema_name, client = heartbeat_environment
+    instance_id = f"crash-{uuid.uuid4()}"
+    process = start_worker(schema_name, instance_id)
+    registered_worker_id = worker_id(schema_name, instance_id, process)
+    response = client.post(
+        "/tasks",
+        json={"task_type": "test.sleep", "payload": {"duration_ms": 3000}},
+    )
+    task_id = response.json()["id"]
+    wait_for_task_status(client, task_id, "RUNNING", process)
+    initial_lease = read_task_lease(schema_name, task_id)
+    time.sleep(0.25)
+    renewed_lease = read_task_lease(schema_name, task_id)
+    assert renewed_lease > initial_lease
+
+    process.kill()
+    process.wait(timeout=5)
+    wait_for_liveness(client, registered_worker_id, "DEAD")
+    with schema_connection(schema_name) as connection:
+        task_state = connection.execute(
+            "SELECT status::text, attempt_count, lease_expires_at < clock_timestamp() FROM tasks WHERE id = %s",
+            (task_id,),
+        ).fetchone()
+        attempt_state = connection.execute(
+            "SELECT status::text, finished_at FROM task_attempts WHERE task_id = %s",
+            (task_id,),
+        ).fetchone()
+    assert task_state == ("RUNNING", 1, True)
+    assert attempt_state == ("RUNNING", None)
+    print("WORKER_CRASH worker=DEAD task=RUNNING attempt=RUNNING lease=EXPIRED")
 
 
 def test_multiple_workers_heartbeat_independently(

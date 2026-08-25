@@ -261,19 +261,20 @@ func TestClaimRollbackWhenAttemptInsertFails(t *testing.T) {
 	var status string
 	var attemptCount int
 	var claimedBy *string
+	var leaseExpiresAt *time.Time
 	if err := database.pool.QueryRow(
 		ctx,
-		`SELECT status::text, attempt_count, claimed_by_worker_id::text FROM tasks WHERE id = $1::uuid`,
+		`SELECT status::text, attempt_count, claimed_by_worker_id::text, lease_expires_at FROM tasks WHERE id = $1::uuid`,
 		taskID,
-	).Scan(&status, &attemptCount, &claimedBy); err != nil {
+	).Scan(&status, &attemptCount, &claimedBy, &leaseExpiresAt); err != nil {
 		t.Fatalf("read rolled back task: %v", err)
 	}
 	var attempts int
 	if err := database.pool.QueryRow(ctx, `SELECT count(*) FROM task_attempts WHERE task_id = $1::uuid`, taskID).Scan(&attempts); err != nil {
 		t.Fatalf("count rolled back attempts: %v", err)
 	}
-	if status != "QUEUED" || attemptCount != 0 || claimedBy != nil || attempts != 0 {
-		t.Fatalf("rollback failed status=%s attempts=%d claimed_by=%v attempt_rows=%d", status, attemptCount, claimedBy, attempts)
+	if status != "QUEUED" || attemptCount != 0 || claimedBy != nil || leaseExpiresAt != nil || attempts != 0 {
+		t.Fatalf("rollback failed status=%s attempts=%d claimed_by=%v lease=%v attempt_rows=%d", status, attemptCount, claimedBy, leaseExpiresAt, attempts)
 	}
 
 	if _, err := database.pool.Exec(ctx, `DROP TRIGGER reject_tf005_attempt ON task_attempts; DROP FUNCTION reject_tf005_attempt()`); err != nil {

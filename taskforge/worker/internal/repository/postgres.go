@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -69,7 +70,12 @@ func (r *Postgres) Heartbeat(
 func (r *Postgres) ClaimNext(
 	ctx context.Context,
 	workerID string,
+	leaseDurations ...time.Duration,
 ) (*domain.ClaimedTask, error) {
+	leaseDuration := 30 * time.Second
+	if len(leaseDurations) > 0 {
+		leaseDuration = leaseDurations[0]
+	}
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("begin claim transaction: %w", err)
@@ -114,16 +120,21 @@ func (r *Postgres) ClaimNext(
 		SET
 			status = 'RUNNING',
 			claimed_by_worker_id = $2::uuid,
-			attempt_count = $3
+			attempt_count = $3,
+			lease_expires_at = clock_timestamp() + $4 * interval '1 microsecond'
 		WHERE id = $1::uuid
 		  AND status = 'QUEUED'
+		RETURNING lease_expires_at
 	`
-	commandTag, err := tx.Exec(ctx, claimTask, task.ID, workerID, task.AttemptNumber)
-	if err != nil {
+	if err := tx.QueryRow(
+		ctx,
+		claimTask,
+		task.ID,
+		workerID,
+		task.AttemptNumber,
+		leaseDuration.Microseconds(),
+	).Scan(&task.LeaseExpiresAt); err != nil {
 		return nil, fmt.Errorf("mark task running: %w", err)
-	}
-	if commandTag.RowsAffected() != 1 {
-		return nil, errors.New("queued task changed before claim")
 	}
 
 	const createAttempt = `
@@ -153,6 +164,44 @@ func (r *Postgres) ClaimNext(
 	return task, nil
 }
 
+func (r *Postgres) RenewLease(
+	ctx context.Context,
+	taskID string,
+	workerID string,
+	attemptNumber int16,
+	leaseDuration time.Duration,
+) (time.Time, error) {
+	const query = `
+		WITH lease_clock AS (
+			SELECT clock_timestamp() AS now
+		)
+		UPDATE tasks
+		SET lease_expires_at = lease_clock.now + $4 * interval '1 microsecond'
+		FROM lease_clock
+		WHERE tasks.id = $1::uuid
+		  AND tasks.status = 'RUNNING'
+		  AND tasks.claimed_by_worker_id = $2::uuid
+		  AND tasks.attempt_count = $3
+		  AND tasks.lease_expires_at > lease_clock.now
+		RETURNING tasks.lease_expires_at
+	`
+	var leaseExpiresAt time.Time
+	if err := r.pool.QueryRow(
+		ctx,
+		query,
+		taskID,
+		workerID,
+		attemptNumber,
+		leaseDuration.Microseconds(),
+	).Scan(&leaseExpiresAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, domain.ErrLeaseLost
+		}
+		return time.Time{}, fmt.Errorf("renew task lease: %w", err)
+	}
+	return leaseExpiresAt, nil
+}
+
 func (r *Postgres) Complete(
 	ctx context.Context,
 	workerID string,
@@ -169,42 +218,40 @@ func (r *Postgres) Complete(
 	}()
 
 	const selectState = `
-		SELECT status::text, COALESCE(claimed_by_worker_id::text, '')
+		SELECT
+			status::text,
+			COALESCE(claimed_by_worker_id::text, ''),
+			attempt_count,
+			COALESCE(lease_expires_at > clock_timestamp(), false)
 		FROM tasks
 		WHERE id = $1::uuid
 		FOR UPDATE
 	`
 	var taskStatus string
 	var claimedBy string
-	if err := tx.QueryRow(ctx, selectState, task.ID).Scan(&taskStatus, &claimedBy); err != nil {
+	var attemptNumber int16
+	var leaseValid bool
+	if err := tx.QueryRow(ctx, selectState, task.ID).Scan(
+		&taskStatus,
+		&claimedBy,
+		&attemptNumber,
+		&leaseValid,
+	); err != nil {
 		return fmt.Errorf("lock task for completion: %w", err)
 	}
 
-	if taskStatus == "CANCELLED" {
-		if _, err := tx.Exec(
-			ctx,
-			`
-				UPDATE task_attempts
-				SET status = 'CANCELLED', finished_at = clock_timestamp(), error = 'task cancelled'
-				WHERE id = $1::uuid AND status = 'RUNNING'
-			`,
-			task.AttemptID,
-		); err != nil {
-			return fmt.Errorf("cancel task attempt: %w", err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit cancelled attempt: %w", err)
-		}
-		return nil
-	}
-
-	if taskStatus != "RUNNING" || claimedBy != workerID {
+	if taskStatus != "RUNNING" || claimedBy != workerID ||
+		attemptNumber != task.AttemptNumber || !leaseValid {
 		return fmt.Errorf(
-			"task %s is not claimed by worker %s (status=%s, claimed_by=%s)",
+			"%w: task=%s worker=%s attempt=%d status=%s claimed_by=%s current_attempt=%d lease_valid=%t",
+			domain.ErrLeaseLost,
 			task.ID,
 			workerID,
+			task.AttemptNumber,
 			taskStatus,
 			claimedBy,
+			attemptNumber,
+			leaseValid,
 		)
 	}
 
@@ -242,48 +289,58 @@ func completeSuccess(
 	commandTag, err := tx.Exec(
 		ctx,
 		`
-			UPDATE task_attempts
-			SET
-				status = 'SUCCEEDED',
-				finished_at = clock_timestamp(),
-				output = $2::jsonb,
-				error = NULL
-			WHERE id = $1::uuid
-			  AND status = 'RUNNING'
-		`,
-		task.AttemptID,
-		result,
-	)
-	if err != nil {
-		return fmt.Errorf("mark task attempt succeeded: %w", err)
-	}
-	if commandTag.RowsAffected() != 1 {
-		return errors.New("task attempt changed before success submission")
-	}
-
-	commandTag, err = tx.Exec(
-		ctx,
-		`
 			UPDATE tasks
 			SET
 				status = 'SUCCEEDED',
 				completed_at = clock_timestamp(),
-				result = $3::jsonb,
+				result = $4::jsonb,
 				last_error = NULL,
-				claimed_by_worker_id = NULL
+				claimed_by_worker_id = NULL,
+				lease_expires_at = NULL
 			WHERE id = $1::uuid
 			  AND status = 'RUNNING'
 			  AND claimed_by_worker_id = $2::uuid
+			  AND attempt_count = $3
+			  AND lease_expires_at > clock_timestamp()
 		`,
 		task.ID,
 		workerID,
+		task.AttemptNumber,
 		result,
 	)
 	if err != nil {
 		return fmt.Errorf("mark task succeeded: %w", err)
 	}
 	if commandTag.RowsAffected() != 1 {
-		return errors.New("task claim was lost before success submission")
+		return domain.ErrLeaseLost
+	}
+
+	commandTag, err = tx.Exec(
+		ctx,
+		`
+			UPDATE task_attempts
+			SET
+				status = 'SUCCEEDED',
+				finished_at = clock_timestamp(),
+				output = $5::jsonb,
+				error = NULL
+			WHERE id = $1::uuid
+			  AND task_id = $2::uuid
+			  AND worker_id = $3::uuid
+			  AND attempt_number = $4
+			  AND status = 'RUNNING'
+		`,
+		task.AttemptID,
+		task.ID,
+		workerID,
+		task.AttemptNumber,
+		result,
+	)
+	if err != nil {
+		return fmt.Errorf("mark task attempt succeeded: %w", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return domain.ErrLeaseLost
 	}
 	return nil
 }
@@ -298,48 +355,58 @@ func completeFailure(
 	commandTag, err := tx.Exec(
 		ctx,
 		`
-			UPDATE task_attempts
-			SET
-				status = 'FAILED',
-				finished_at = clock_timestamp(),
-				output = NULL,
-				error = $2
-			WHERE id = $1::uuid
-			  AND status = 'RUNNING'
-		`,
-		task.AttemptID,
-		message,
-	)
-	if err != nil {
-		return fmt.Errorf("mark task attempt failed: %w", err)
-	}
-	if commandTag.RowsAffected() != 1 {
-		return errors.New("task attempt changed before failure submission")
-	}
-
-	commandTag, err = tx.Exec(
-		ctx,
-		`
 			UPDATE tasks
 			SET
 				status = 'FAILED',
 				completed_at = clock_timestamp(),
 				result = NULL,
-				last_error = $3,
-				claimed_by_worker_id = NULL
+				last_error = $4,
+				claimed_by_worker_id = NULL,
+				lease_expires_at = NULL
 			WHERE id = $1::uuid
 			  AND status = 'RUNNING'
 			  AND claimed_by_worker_id = $2::uuid
+			  AND attempt_count = $3
+			  AND lease_expires_at > clock_timestamp()
 		`,
 		task.ID,
 		workerID,
+		task.AttemptNumber,
 		message,
 	)
 	if err != nil {
 		return fmt.Errorf("mark task failed: %w", err)
 	}
 	if commandTag.RowsAffected() != 1 {
-		return errors.New("task claim was lost before failure submission")
+		return domain.ErrLeaseLost
+	}
+
+	commandTag, err = tx.Exec(
+		ctx,
+		`
+			UPDATE task_attempts
+			SET
+				status = 'FAILED',
+				finished_at = clock_timestamp(),
+				output = NULL,
+				error = $5
+			WHERE id = $1::uuid
+			  AND task_id = $2::uuid
+			  AND worker_id = $3::uuid
+			  AND attempt_number = $4
+			  AND status = 'RUNNING'
+		`,
+		task.AttemptID,
+		task.ID,
+		workerID,
+		task.AttemptNumber,
+		message,
+	)
+	if err != nil {
+		return fmt.Errorf("mark task attempt failed: %w", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return domain.ErrLeaseLost
 	}
 	return nil
 }

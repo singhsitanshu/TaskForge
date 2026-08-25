@@ -28,13 +28,15 @@ The Go worker registers a process-lifetime instance identity in PostgreSQL, poll
 
 The registry contains `test.echo`, `test.fail`, and a bounded `test.sleep` integration-test handler. Unknown task types fail safely; the worker never executes task-provided code or commands.
 
-Each process runs two independent lifecycle loops:
+Each process keeps process liveness separate from per-task ownership:
 
     Worker process
-      |-- claim/execution loop
-      `-- heartbeat loop
+      |-- process heartbeat loop
+      `-- execution
+          |-- handler
+          `-- task lease renewal loop
 
-Registration initializes the heartbeat using PostgreSQL time. The heartbeat loop periodically updates only its worker row and continues while a handler is executing. Shutdown cancels both loops and waits for them before closing the database pool. Worker liveness is derived by the API from heartbeat age and is never persisted as `ACTIVE`, `STALE`, or `DEAD`. Detection does not alter tasks or attempts; a dead worker's running work remains stranded until a later recovery milestone.
+Registration initializes the heartbeat using PostgreSQL time. The heartbeat loop periodically updates only its worker row. Each claimed task receives a database-time lease and a task-specific renewal goroutine while its handler runs. Completion requires the same worker, attempt, and an unexpired lease. Shutdown cancels these loops and waits before closing the database pool. Worker liveness is derived from heartbeat age; lease validity is derived independently from task ownership. Expired work remains `RUNNING` until a later recovery milestone.
 
 ### PostgreSQL (`postgres`)
 
@@ -57,7 +59,8 @@ Redis is reserved for future transient coordination. It is not used by the API-t
                                               PostgreSQL
                                                 ^   ^
                           poll/claim/attempts ---+   +--- schedule queries (future)
-                          results + heartbeat    |        Scheduler
+                          results, leases,       |        Scheduler
+                          and heartbeat          |
                                                 |
                                              Worker
 

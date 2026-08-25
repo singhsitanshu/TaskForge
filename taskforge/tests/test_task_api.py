@@ -25,16 +25,22 @@ def database_schema() -> Iterator[str]:
 
     schema_name = f"task_api_test_{uuid.uuid4().hex}"
     with psycopg.connect(database_url, autocommit=True) as connection:
-        connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
         try:
-            connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name)))
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
             connection.execute(UP_SQL)
             yield schema_name
         finally:
             connection.execute(DOWN_SQL)
             connection.execute("SET search_path TO public")
             connection.execute(
-                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema_name))
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
             )
 
 
@@ -189,7 +195,11 @@ def test_cancel_running_task_returns_conflict_and_preserves_attempt(
         connection.execute(
             """
             UPDATE tasks
-            SET status = 'RUNNING', claimed_by_worker_id = %s, attempt_count = 1
+            SET
+                status = 'RUNNING',
+                claimed_by_worker_id = %s,
+                attempt_count = 1,
+                lease_expires_at = clock_timestamp() + interval '1 minute'
             WHERE id = %s
             """,
             (worker_id, submitted["id"]),

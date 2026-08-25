@@ -1,6 +1,6 @@
 # TaskForge
 
-TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission, a priority-aware PostgreSQL-polling worker for predefined test handlers, durable worker heartbeats, and derived worker liveness visibility. Scheduling, retries, leases, recovery, Redis dispatch, and arbitrary task execution are not implemented.
+TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission, priority-aware PostgreSQL workers, durable worker heartbeats, derived liveness, and renewable task ownership leases. Scheduling, retries, expired-task recovery, Redis dispatch, and arbitrary task execution are not implemented.
 
 ## Services
 

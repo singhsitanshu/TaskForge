@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -75,7 +76,7 @@ func run() error {
 		return fmt.Errorf("wait for release: %w", err)
 	}
 
-	task, err := store.ClaimNext(ctx, workerID)
+	task, err := store.ClaimNext(ctx, workerID, 30*time.Second)
 	if err != nil {
 		return err
 	}

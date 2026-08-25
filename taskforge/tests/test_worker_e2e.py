@@ -28,9 +28,13 @@ def worker_environment() -> Iterator[tuple[str, TestClient]]:
 
     schema_name = f"worker_e2e_test_{uuid.uuid4().hex}"
     with psycopg.connect(database_url, autocommit=True) as connection:
-        connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
         try:
-            connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name)))
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
             connection.execute(UP_SQL)
 
             application = create_app(
@@ -45,7 +49,9 @@ def worker_environment() -> Iterator[tuple[str, TestClient]]:
             connection.execute(DOWN_SQL)
             connection.execute("SET search_path TO public")
             connection.execute(
-                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema_name))
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
             )
 
 
@@ -190,7 +196,7 @@ def test_api_submission_worker_execution_and_poll_again(
         with schema_connection(schema_name) as connection:
             attempts = connection.execute(
                 """
-                SELECT ta.status::text, ta.lease_token, ta.lease_expires_at
+                SELECT ta.status::text
                 FROM task_attempts AS ta
                 JOIN tasks AS t ON t.id = ta.task_id
                 WHERE t.id IN (%s, %s)
@@ -199,8 +205,8 @@ def test_api_submission_worker_execution_and_poll_again(
                 (first_response.json()["id"], second_response.json()["id"]),
             ).fetchall()
         assert attempts == [
-            ("SUCCEEDED", None, None),
-            ("SUCCEEDED", None, None),
+            ("SUCCEEDED",),
+            ("SUCCEEDED",),
         ]
     finally:
         output = stop_worker(process)
