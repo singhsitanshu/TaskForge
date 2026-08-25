@@ -16,6 +16,8 @@ type Postgres struct {
 	pool *pgxpool.Pool
 }
 
+var ErrWorkerNotFound = errors.New("worker registration not found")
+
 func NewPostgres(pool *pgxpool.Pool) *Postgres {
 	return &Postgres{pool: pool}
 }
@@ -26,10 +28,13 @@ func (r *Postgres) RegisterWorker(
 	name string,
 ) (string, error) {
 	const query = `
-		INSERT INTO workers (instance_id, name, enabled)
-		VALUES ($1, $2, true)
+		INSERT INTO workers (instance_id, name, enabled, last_seen_at)
+		VALUES ($1, $2, true, clock_timestamp())
 		ON CONFLICT (instance_id)
-		DO UPDATE SET name = EXCLUDED.name, enabled = true
+		DO UPDATE SET
+			name = EXCLUDED.name,
+			enabled = true,
+			last_seen_at = clock_timestamp()
 		RETURNING id::text
 	`
 
@@ -38,6 +43,27 @@ func (r *Postgres) RegisterWorker(
 		return "", fmt.Errorf("register worker: %w", err)
 	}
 	return workerID, nil
+}
+
+func (r *Postgres) Heartbeat(
+	ctx context.Context,
+	workerID string,
+	instanceID string,
+) error {
+	const query = `
+		UPDATE workers
+		SET last_seen_at = clock_timestamp()
+		WHERE id = $1::uuid
+		  AND instance_id = $2
+	`
+	commandTag, err := r.pool.Exec(ctx, query, workerID, instanceID)
+	if err != nil {
+		return fmt.Errorf("update worker heartbeat: %w", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return ErrWorkerNotFound
+	}
+	return nil
 }
 
 func (r *Postgres) ClaimNext(
@@ -53,12 +79,19 @@ func (r *Postgres) ClaimNext(
 	}()
 
 	const selectTask = `
-		SELECT id::text, task_type, payload, (attempt_count + 1)::smallint
-		FROM tasks
-		WHERE status = 'QUEUED'
-		  AND scheduled_at <= clock_timestamp()
-		  AND attempt_count < max_attempts
-		ORDER BY priority DESC, created_at ASC, id ASC
+		SELECT
+			candidate.id::text,
+			candidate.task_type,
+			candidate.payload,
+			(candidate.attempt_count + 1)::smallint
+		FROM tasks AS candidate
+		WHERE candidate.status = 'QUEUED'
+		  AND candidate.scheduled_at <= clock_timestamp()
+		  AND candidate.attempt_count < candidate.max_attempts
+		ORDER BY
+			candidate.priority DESC,
+			candidate.created_at ASC,
+			candidate.id ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
 	`

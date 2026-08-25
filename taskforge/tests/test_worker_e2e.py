@@ -315,7 +315,10 @@ def test_worker_claims_by_priority_age_and_id(
         output = stop_worker(process)
         assert process.returncode == 0, output
 
-    executed_ids = re.findall(r"executing task id=([0-9a-f-]+)", output)
+    executed_ids = re.findall(
+        r"event=task_claimed worker_instance_id=\S+ task_id=([0-9a-f-]+)",
+        output,
+    )
     assert executed_ids == [str(task_id) for task_id, _, _, _ in ordered_tasks]
 
     with schema_connection(schema_name) as connection:

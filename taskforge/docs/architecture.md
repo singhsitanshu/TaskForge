@@ -2,7 +2,7 @@
 
 ## Scope
 
-This milestone implements task creation and the first worker execution path. The worker supports only predefined test handlers and polls PostgreSQL directly. Schedule evaluation, retries, leases, Redis dispatch, heartbeats, and arbitrary task execution remain out of scope.
+This milestone implements task creation, the first worker execution path, and worker-liveness visibility. The worker supports only predefined test handlers, polls PostgreSQL directly, and records periodic heartbeats. Schedule evaluation, retries, leases, recovery, Redis dispatch, and arbitrary task execution remain out of scope.
 
 ## Service boundaries
 
@@ -14,7 +14,7 @@ The React/TypeScript application is the browser-facing interface. It is built as
 
 The FastAPI service is the public application boundary. It owns request validation and task lifecycle mutations. PostgreSQL is the source of truth for durable state. Clients never depend on PostgreSQL or Redis directly.
 
-The current API exposes `/healthz`, task submission, retrieval, listing, and cancellation, plus FastAPI's generated documentation.
+The current API exposes `/healthz`, task submission, retrieval, listing, cancellation, and worker list/detail liveness, plus FastAPI's generated documentation.
 
 ### Scheduler (`scheduler`)
 
@@ -24,9 +24,17 @@ The current scheduler starts an operational HTTP server with only `/healthz`; it
 
 ### Worker (`worker`)
 
-The Go worker registers a process-lifetime instance identity in PostgreSQL, polls for eligible `QUEUED` tasks, atomically claims one task, records an attempt, executes a registered handler, and persists success or failure before polling again. Eligible work is ordered by priority descending, creation time ascending, then task ID ascending. `FOR UPDATE SKIP LOCKED` prevents simultaneous claimers from locking the same row.
+The Go worker registers a process-lifetime instance identity in PostgreSQL, polls for eligible `QUEUED` tasks, atomically claims one task, records an attempt, executes a registered handler, and persists success or failure before polling again. Eligible work is ordered by priority descending, creation time ascending, then task ID ascending. `FOR UPDATE SKIP LOCKED` coordinates simultaneous claimers; ownership transition and attempt creation commit before handler execution begins. The controlled contention proof is documented in `docs/tf-005.md`.
 
-The registry currently contains only `test.echo` and `test.fail`. Unknown task types fail safely; the worker never executes task-provided code or commands. This first version intentionally has no retry, lease, Redis, or heartbeat behavior.
+The registry contains `test.echo`, `test.fail`, and a bounded `test.sleep` integration-test handler. Unknown task types fail safely; the worker never executes task-provided code or commands.
+
+Each process runs two independent lifecycle loops:
+
+    Worker process
+      |-- claim/execution loop
+      `-- heartbeat loop
+
+Registration initializes the heartbeat using PostgreSQL time. The heartbeat loop periodically updates only its worker row and continues while a handler is executing. Shutdown cancels both loops and waits for them before closing the database pool. Worker liveness is derived by the API from heartbeat age and is never persisted as `ACTIVE`, `STALE`, or `DEAD`. Detection does not alter tasks or attempts; a dead worker's running work remains stranded until a later recovery milestone.
 
 ### PostgreSQL (`postgres`)
 
@@ -49,7 +57,7 @@ Redis is reserved for future transient coordination. It is not used by the API-t
                                               PostgreSQL
                                                 ^   ^
                           poll/claim/attempts ---+   +--- schedule queries (future)
-                          and result writes      |        Scheduler
+                          results + heartbeat    |        Scheduler
                                                 |
                                              Worker
 
@@ -65,7 +73,7 @@ Each container has a health check:
 - Redis uses `redis-cli ping`.
 - API, scheduler, worker, and web expose `/healthz`.
 
-Compose waits for PostgreSQL before starting the API and worker, and waits for the API before starting the web container. The worker registers before starting its polling loop. Worker health endpoints remain internal to the Compose network so replicas do not compete for a host port. HTTP health endpoints remain liveness checks.
+Compose waits for PostgreSQL before starting the API and worker, and waits for the API before starting the web container. The worker registers before starting its polling and heartbeat loops. Worker health endpoints remain internal to the Compose network so replicas do not compete for a host port. HTTP health endpoints report process health; control-plane worker liveness is derived separately from durable heartbeats.
 
 ## Ownership rules
 

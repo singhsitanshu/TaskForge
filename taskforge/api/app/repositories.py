@@ -6,7 +6,7 @@ from psycopg import errors
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from app.domain import NewTask, Task, TaskStatus
+from app.domain import NewTask, Task, TaskStatus, WorkerRecord
 
 _TASK_COLUMNS = """
     id,
@@ -48,6 +48,12 @@ class TaskRepository(Protocol):
     ) -> Sequence[Task]: ...
 
     async def cancel_active(self, task_id: UUID) -> Task | None: ...
+
+
+class WorkerRepository(Protocol):
+    async def get(self, worker_id: UUID) -> WorkerRecord | None: ...
+
+    async def list(self, *, limit: int, offset: int) -> Sequence[WorkerRecord]: ...
 
 
 class PostgresTaskRepository:
@@ -166,4 +172,55 @@ def _task_from_row(row: dict[str, Any]) -> Task:
         idempotency_key=row["idempotency_key"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+_WORKER_COLUMNS = """
+    id,
+    instance_id,
+    name,
+    enabled,
+    metadata,
+    last_seen_at AS last_heartbeat,
+    created_at AS registered_at,
+    updated_at,
+    statement_timestamp() AS observed_at
+"""
+
+
+class PostgresWorkerRepository:
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def get(self, worker_id: UUID) -> WorkerRecord | None:
+        query = f"SELECT {_WORKER_COLUMNS} FROM workers WHERE id = %s"
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(query, (worker_id,))
+            row = await cursor.fetchone()
+        return _worker_from_row(row) if row else None
+
+    async def list(self, *, limit: int, offset: int) -> Sequence[WorkerRecord]:
+        query = f"""
+            SELECT {_WORKER_COLUMNS}
+            FROM workers
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s OFFSET %s
+        """
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(query, (limit, offset))
+            rows = await cursor.fetchall()
+        return [_worker_from_row(row) for row in rows]
+
+
+def _worker_from_row(row: dict[str, Any]) -> WorkerRecord:
+    return WorkerRecord(
+        id=row["id"],
+        instance_id=row["instance_id"],
+        name=row["name"],
+        enabled=row["enabled"],
+        metadata=row["metadata"],
+        last_heartbeat=row["last_heartbeat"],
+        registered_at=row["registered_at"],
+        updated_at=row["updated_at"],
+        observed_at=row["observed_at"],
     )

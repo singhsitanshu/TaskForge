@@ -28,6 +28,7 @@ type Worker struct {
 	store        Store
 	executor     Executor
 	workerID     string
+	instanceID   string
 	pollInterval time.Duration
 	logger       *log.Logger
 }
@@ -36,6 +37,7 @@ func New(
 	store Store,
 	executor Executor,
 	workerID string,
+	instanceID string,
 	pollInterval time.Duration,
 	logger *log.Logger,
 ) *Worker {
@@ -43,6 +45,7 @@ func New(
 		store:        store,
 		executor:     executor,
 		workerID:     workerID,
+		instanceID:   instanceID,
 		pollInterval: pollInterval,
 		logger:       logger,
 	}
@@ -70,10 +73,11 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 
 		w.logger.Printf(
-			"executing task id=%s type=%s attempt=%d",
+			"event=task_claimed worker_instance_id=%s task_id=%s attempt_number=%d task_type=%s",
+			w.instanceID,
 			task.ID,
-			task.Type,
 			task.AttemptNumber,
+			task.Type,
 		)
 		result, executionErr := w.executor.Execute(ctx, task.Type, task.Payload)
 		if err := w.store.Complete(
@@ -83,16 +87,33 @@ func (w *Worker) Run(ctx context.Context) {
 			result,
 			executionErr,
 		); err != nil {
-			w.logger.Printf("submit task completion id=%s: %v", task.ID, err)
+			w.logger.Printf(
+				"event=task_completion_failed worker_instance_id=%s task_id=%s attempt_number=%d error=%q",
+				w.instanceID,
+				task.ID,
+				task.AttemptNumber,
+				err,
+			)
 			if !wait(ctx, w.pollInterval) {
 				return
 			}
 			continue
 		}
 		if executionErr != nil {
-			w.logger.Printf("task failed id=%s: %v", task.ID, executionErr)
+			w.logger.Printf(
+				"event=task_failed worker_instance_id=%s task_id=%s attempt_number=%d error=%q",
+				w.instanceID,
+				task.ID,
+				task.AttemptNumber,
+				executionErr,
+			)
 		} else {
-			w.logger.Printf("task succeeded id=%s", task.ID)
+			w.logger.Printf(
+				"event=task_succeeded worker_instance_id=%s task_id=%s attempt_number=%d",
+				w.instanceID,
+				task.ID,
+				task.AttemptNumber,
+			)
 		}
 	}
 }

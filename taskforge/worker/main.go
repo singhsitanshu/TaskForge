@@ -12,11 +12,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	workerconfig "taskforge/worker/internal/config"
 	"taskforge/worker/internal/handler"
 	"taskforge/worker/internal/repository"
 	workerservice "taskforge/worker/internal/service"
@@ -39,6 +41,10 @@ func run() error {
 		return err
 	}
 	pollInterval, err := durationEnv("POLL_INTERVAL", time.Second)
+	if err != nil {
+		return err
+	}
+	heartbeatConfig, err := resolveHeartbeatConfig()
 	if err != nil {
 		return err
 	}
@@ -65,17 +71,27 @@ func run() error {
 		return err
 	}
 	log.Printf(
-		"registered worker id=%s instance_id=%s name=%s",
-		workerID,
+		"event=worker_registered worker_instance_id=%s worker_id=%s name=%q heartbeat_interval=%s",
 		identity.InstanceID,
+		workerID,
 		identity.Name,
+		heartbeatConfig.Interval,
 	)
 
 	worker := workerservice.New(
 		store,
 		handler.NewRegistry(),
 		workerID,
+		identity.InstanceID,
 		pollInterval,
+		log.Default(),
+	)
+	heartbeater := workerservice.NewHeartbeater(
+		store,
+		workerID,
+		identity.InstanceID,
+		heartbeatConfig.Interval,
+		heartbeatConfig.Timeout,
 		log.Default(),
 	)
 	server := &http.Server{
@@ -93,9 +109,16 @@ func run() error {
 	}()
 
 	workerStopped := make(chan struct{})
+	var lifecycle sync.WaitGroup
+	lifecycle.Add(2)
 	go func() {
+		defer lifecycle.Done()
 		defer close(workerStopped)
 		worker.Run(ctx)
+	}()
+	go func() {
+		defer lifecycle.Done()
+		heartbeater.Run(ctx)
 	}()
 
 	var runErr error
@@ -108,12 +131,19 @@ func run() error {
 			runErr = errors.New("worker loop stopped unexpectedly")
 		}
 	}
+	stop()
 
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownContext); err != nil && runErr == nil {
 		runErr = fmt.Errorf("shutdown health server: %w", err)
 	}
+	lifecycle.Wait()
+	log.Printf(
+		"event=worker_shutdown worker_instance_id=%s worker_id=%s",
+		identity.InstanceID,
+		workerID,
+	)
 	return runErr
 }
 
@@ -187,6 +217,42 @@ func durationEnv(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be a positive Go duration", key)
 	}
 	return duration, nil
+}
+
+func resolveHeartbeatConfig() (workerconfig.Heartbeat, error) {
+	interval, err := durationEnv(
+		"WORKER_HEARTBEAT_INTERVAL",
+		workerconfig.DefaultHeartbeatInterval,
+	)
+	if err != nil {
+		return workerconfig.Heartbeat{}, err
+	}
+	staleAfter, err := durationEnv("WORKER_STALE_AFTER", workerconfig.DefaultStaleAfter)
+	if err != nil {
+		return workerconfig.Heartbeat{}, err
+	}
+	deadAfter, err := durationEnv("WORKER_DEAD_AFTER", workerconfig.DefaultDeadAfter)
+	if err != nil {
+		return workerconfig.Heartbeat{}, err
+	}
+	timeout, err := durationEnv(
+		"WORKER_HEARTBEAT_TIMEOUT",
+		workerconfig.DefaultHeartbeatTimeout,
+	)
+	if err != nil {
+		return workerconfig.Heartbeat{}, err
+	}
+
+	configuration := workerconfig.Heartbeat{
+		Interval:   interval,
+		StaleAfter: staleAfter,
+		DeadAfter:  deadAfter,
+		Timeout:    timeout,
+	}
+	if err := configuration.Validate(); err != nil {
+		return workerconfig.Heartbeat{}, err
+	}
+	return configuration, nil
 }
 
 func envOrDefault(key, fallback string) string {

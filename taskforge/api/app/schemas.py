@@ -4,7 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from app.domain import NewTask, Task, TaskStatus
+from app.domain import NewTask, Task, TaskStatus, Worker
+from app.liveness import WorkerLiveness
 
 QueueName = Annotated[
     str,
@@ -71,5 +72,30 @@ class TaskResponse(BaseModel):
 
 class TaskListResponse(BaseModel):
     items: list[TaskResponse]
+    limit: int
+    offset: int
+
+
+class WorkerResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    instance_id: str
+    name: str
+    enabled: bool
+    registered_at: datetime
+    last_heartbeat: datetime | None
+    updated_at: datetime
+    liveness: WorkerLiveness
+    heartbeat_age_seconds: float | None
+    metadata: dict[str, Any]
+
+    @classmethod
+    def from_domain(cls, worker: Worker) -> "WorkerResponse":
+        return cls.model_validate(worker)
+
+
+class WorkerListResponse(BaseModel):
+    items: list[WorkerResponse]
     limit: int
     offset: int

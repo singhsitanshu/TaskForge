@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -38,5 +39,28 @@ func TestUnknownHandler(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "no registered handler") {
 		t.Fatalf("expected unregistered handler error, got %v", err)
+	}
+}
+
+func TestSleepHandler(t *testing.T) {
+	result, err := NewRegistry().Execute(
+		context.Background(),
+		"test.sleep",
+		json.RawMessage(`{"duration_ms": 1}`),
+	)
+	if err != nil {
+		t.Fatalf("execute test.sleep: %v", err)
+	}
+	if result["slept_ms"] != 1 {
+		t.Fatalf("unexpected sleep result: %#v", result)
+	}
+}
+
+func TestSleepHandlerHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := NewRegistry().Execute(ctx, "test.sleep", json.RawMessage(`{"duration_ms": 1000}`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
 	}
 }

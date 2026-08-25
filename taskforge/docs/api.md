@@ -40,3 +40,17 @@ Results are ordered by newest creation time, then ID.
 Cancellation is idempotent for an already `CANCELLED` task. Unknown tasks return `404`. `LEASED`, `RUNNING`, `RETRYING`, `SUCCEEDED`, and `FAILED` tasks return `409` without changing task or attempt state.
 
 This endpoint changes lifecycle state only. It does not execute tasks or implement worker behavior.
+
+## List workers
+
+`GET /workers` returns an object with `items`, `limit`, and `offset`. Workers are ordered by registration time and ID, newest first. Each item includes:
+
+- `id`, `instance_id`, and human-readable `name`.
+- Administrative `enabled` state and non-sensitive `metadata`.
+- `registered_at`, `last_heartbeat`, and `updated_at` timestamps.
+- Derived `liveness`: `ACTIVE`, `STALE`, or `DEAD`.
+- `heartbeat_age_seconds`, calculated from the same PostgreSQL reference timestamp as liveness.
+
+## Get a worker
+
+`GET /workers/{worker_id}` returns the same worker representation or `404`. Liveness is derived when the request is served; it is not persisted as a status column.

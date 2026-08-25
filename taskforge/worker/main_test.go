@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHealthcheck(t *testing.T) {
@@ -53,5 +54,23 @@ func TestResolveFallbackWorkerIdentity(t *testing.T) {
 	}
 	if identity.Name != hostname {
 		t.Fatalf("expected hostname %q as name, got %q", hostname, identity.Name)
+	}
+}
+
+func TestResolveHeartbeatConfiguration(t *testing.T) {
+	t.Setenv("WORKER_HEARTBEAT_INTERVAL", "100ms")
+	t.Setenv("WORKER_STALE_AFTER", "300ms")
+	t.Setenv("WORKER_DEAD_AFTER", "700ms")
+	t.Setenv("WORKER_HEARTBEAT_TIMEOUT", "50ms")
+
+	configuration, err := resolveHeartbeatConfig()
+	if err != nil {
+		t.Fatalf("resolve heartbeat configuration: %v", err)
+	}
+	if configuration.Interval != 100*time.Millisecond ||
+		configuration.StaleAfter != 300*time.Millisecond ||
+		configuration.DeadAfter != 700*time.Millisecond ||
+		configuration.Timeout != 50*time.Millisecond {
+		t.Fatalf("unexpected heartbeat configuration: %#v", configuration)
 	}
 }

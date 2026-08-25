@@ -4,6 +4,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
+from app.liveness import WorkerLiveness
+
 
 class TaskStatus(StrEnum):
     QUEUED = "QUEUED"
@@ -45,3 +47,30 @@ class NewTask:
     max_attempts: int
     scheduled_at: datetime | None
     idempotency_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRecord:
+    id: UUID
+    instance_id: str
+    name: str
+    enabled: bool
+    metadata: dict[str, Any]
+    last_heartbeat: datetime | None
+    registered_at: datetime
+    updated_at: datetime
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Worker:
+    id: UUID
+    instance_id: str
+    name: str
+    enabled: bool
+    metadata: dict[str, Any]
+    last_heartbeat: datetime | None
+    registered_at: datetime
+    updated_at: datetime
+    liveness: WorkerLiveness
+    heartbeat_age_seconds: float | None

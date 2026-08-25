@@ -1,4 +1,4 @@
-.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-api test-migrations test-worker
+.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-claims test-api test-migrations test-worker test-heartbeats
 
 build:
 	docker compose build
@@ -42,6 +42,7 @@ test:
 	cd worker && go test ./...
 	cd web && npm run build
 	$(MAKE) test-integration
+	$(MAKE) test-claims
 
 migrate-up:
 	@./scripts/migrate.sh up
@@ -52,6 +53,9 @@ migrate-down:
 test-integration:
 	docker compose --profile test run --rm --build integration-tests
 
+test-claims:
+	docker compose --profile test run --rm --build claim-tests
+
 test-api:
 	docker compose --profile test run --rm --build integration-tests pytest -q tests/test_task_api.py
 
@@ -60,3 +64,6 @@ test-migrations:
 
 test-worker:
 	docker compose --profile test run --rm --build integration-tests pytest -q tests/test_worker_e2e.py
+
+test-heartbeats:
+	docker compose --profile test run --rm --build integration-tests pytest -q -s tests/test_worker_api.py tests/test_worker_heartbeat.py

@@ -1,14 +1,14 @@
 # TaskForge
 
-TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission and a deliberately small priority-aware PostgreSQL-polling worker for predefined test handlers. Scheduling, retries, leases, Redis dispatch, and arbitrary task execution are not implemented.
+TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission, a priority-aware PostgreSQL-polling worker for predefined test handlers, durable worker heartbeats, and derived worker liveness visibility. Scheduling, retries, leases, recovery, Redis dispatch, and arbitrary task execution are not implemented.
 
 ## Services
 
 | Service | Technology | Local port | Responsibility |
 | --- | --- | ---: | --- |
-| `api` | Python / FastAPI | 8000 | Public task API and task lifecycle ownership |
+| `api` | Python / FastAPI | 8000 | Task control plane and worker-liveness visibility |
 | `scheduler` | Go | 8081 | Future schedule evaluation and dispatch coordination |
-| `worker` | Go | internal | Polls PostgreSQL and executes registered test handlers |
+| `worker` | Go | internal | Polls PostgreSQL, executes registered handlers, and heartbeats independently |
 | `web` | React / TypeScript | 3000 | Browser interface |
 | `postgres` | PostgreSQL | 5432 | Durable application state |
 | `redis` | Redis | 6379 | Future queueing and short-lived coordination |
@@ -29,6 +29,7 @@ Open the web app at <http://localhost:3000> and the API documentation at <http:/
     make format-check  # Verify formatting without modifying files
     make test          # Run service tests and build the frontend
     make test-worker   # Run the PostgreSQL-backed worker end-to-end test
+    make test-heartbeats # Run worker-liveness integration tests
     make migrate-up    # Apply the PostgreSQL schema
     make migrate-down  # Roll back the PostgreSQL schema
     make down          # Stop the local stack

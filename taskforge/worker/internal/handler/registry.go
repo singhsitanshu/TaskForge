@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 type Handler func(context.Context, json.RawMessage) (map[string]any, error)
@@ -17,6 +18,7 @@ func NewRegistry() *Registry {
 	registry := &Registry{handlers: make(map[string]Handler)}
 	registry.Register("test.echo", echo)
 	registry.Register("test.fail", fail)
+	registry.Register("test.sleep", sleep)
 	return registry
 }
 
@@ -46,4 +48,24 @@ func echo(_ context.Context, payload json.RawMessage) (map[string]any, error) {
 
 func fail(_ context.Context, _ json.RawMessage) (map[string]any, error) {
 	return nil, errors.New("test.fail handler requested failure")
+}
+
+func sleep(ctx context.Context, payload json.RawMessage) (map[string]any, error) {
+	var input struct {
+		DurationMilliseconds int `json:"duration_ms"`
+	}
+	if err := json.Unmarshal(payload, &input); err != nil {
+		return nil, fmt.Errorf("decode test.sleep payload: %w", err)
+	}
+	if input.DurationMilliseconds < 1 || input.DurationMilliseconds > 60_000 {
+		return nil, errors.New("test.sleep duration_ms must be between 1 and 60000")
+	}
+	timer := time.NewTimer(time.Duration(input.DurationMilliseconds) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return map[string]any{"slept_ms": input.DurationMilliseconds}, nil
+	}
 }
