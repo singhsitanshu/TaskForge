@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mathrand "math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -49,6 +51,10 @@ func run() error {
 		return err
 	}
 	leaseConfig, err := resolveLeaseConfig()
+	if err != nil {
+		return err
+	}
+	retryConfig, err := resolveRetryConfig()
 	if err != nil {
 		return err
 	}
@@ -92,6 +98,9 @@ func run() error {
 		leaseConfig.RenewInterval,
 		leaseConfig.RenewTimeout,
 		log.Default(),
+		func(retryIndex int) time.Duration {
+			return retryConfig.Delay(retryIndex, mathrand.Float64())
+		},
 	)
 	heartbeater := workerservice.NewHeartbeater(
 		store,
@@ -292,6 +301,39 @@ func resolveLeaseConfig() (workerconfig.Lease, error) {
 	}
 	if err := configuration.Validate(); err != nil {
 		return workerconfig.Lease{}, err
+	}
+	return configuration, nil
+}
+
+func resolveRetryConfig() (workerconfig.Retry, error) {
+	baseDelay, err := durationEnv(
+		"TASK_RETRY_BASE_DELAY",
+		workerconfig.DefaultRetryBaseDelay,
+	)
+	if err != nil {
+		return workerconfig.Retry{}, err
+	}
+	maxDelay, err := durationEnv(
+		"TASK_RETRY_MAX_DELAY",
+		workerconfig.DefaultRetryMaxDelay,
+	)
+	if err != nil {
+		return workerconfig.Retry{}, err
+	}
+	jitter := workerconfig.DefaultRetryJitter
+	if value := os.Getenv("TASK_RETRY_JITTER"); value != "" {
+		jitter, err = strconv.ParseFloat(value, 64)
+		if err != nil {
+			return workerconfig.Retry{}, fmt.Errorf("TASK_RETRY_JITTER must be a number")
+		}
+	}
+	configuration := workerconfig.Retry{
+		BaseDelay: baseDelay,
+		MaxDelay:  maxDelay,
+		Jitter:    jitter,
+	}
+	if err := configuration.Validate(); err != nil {
+		return workerconfig.Retry{}, err
 	}
 	return configuration, nil
 }

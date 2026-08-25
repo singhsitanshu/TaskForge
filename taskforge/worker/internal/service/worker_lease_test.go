@@ -45,12 +45,27 @@ func (s *leaseTestStore) Complete(context.Context, string, *domain.ClaimedTask, 
 	return nil
 }
 
+func (s *leaseTestStore) RetryableFail(
+	context.Context,
+	string,
+	*domain.ClaimedTask,
+	error,
+	time.Duration,
+) (domain.RetryOutcome, error) {
+	return domain.RetryOutcome{}, nil
+}
+
 type leaseTestExecutor struct {
 	duration  time.Duration
 	cancelled chan struct{}
 }
 
-func (e *leaseTestExecutor) Execute(ctx context.Context, _ string, _ json.RawMessage) (map[string]any, error) {
+func (e *leaseTestExecutor) Execute(
+	ctx context.Context,
+	_ string,
+	_ json.RawMessage,
+	_ domain.ExecutionMetadata,
+) (map[string]any, error) {
 	timer := time.NewTimer(e.duration)
 	defer timer.Stop()
 	select {

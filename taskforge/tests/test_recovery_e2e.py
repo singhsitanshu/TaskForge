@@ -77,6 +77,9 @@ def start_scheduler(schema_name: str) -> subprocess.Popen:
             "SCHEDULER_RECOVERY_INTERVAL": "25ms",
             "SCHEDULER_RECOVERY_BATCH_SIZE": "100",
             "SCHEDULER_RECOVERY_DB_TIMEOUT": "1s",
+            "SCHEDULER_RETRY_PROMOTION_INTERVAL": "20ms",
+            "SCHEDULER_RETRY_PROMOTION_BATCH_SIZE": "100",
+            "SCHEDULER_RETRY_PROMOTION_DB_TIMEOUT": "1s",
         }
     )
     return subprocess.Popen(
@@ -105,6 +108,9 @@ def start_worker(schema_name: str, instance_id: str) -> subprocess.Popen:
             "WORKER_TASK_LEASE_DURATION": "400ms",
             "WORKER_TASK_LEASE_RENEW_INTERVAL": "100ms",
             "WORKER_TASK_LEASE_RENEW_TIMEOUT": "50ms",
+            "TASK_RETRY_BASE_DELAY": "100ms",
+            "TASK_RETRY_MAX_DELAY": "400ms",
+            "TASK_RETRY_JITTER": "0",
         }
     )
     return subprocess.Popen(
@@ -284,3 +290,181 @@ def test_crash_recovery_reclaim_and_success(
         assert "task_recovered" in scheduler_output, scheduler_output
         if worker_b is not None:
             assert worker_b.returncode == 0, worker_b_output
+
+
+def test_retry_backoff_then_success(
+    recovery_environment: tuple[str, TestClient],
+) -> None:
+    schema_name, client = recovery_environment
+    scheduler = start_scheduler(schema_name)
+    worker_instance = f"retry-success-{uuid.uuid4().hex}"
+    worker = start_worker(schema_name, worker_instance)
+    try:
+        wait_for_worker(schema_name, worker_instance, worker)
+        response = client.post(
+            "/tasks",
+            json={
+                "task_type": "test.fail_n_then_succeed",
+                "payload": {"failures": 2},
+                "max_attempts": 3,
+            },
+        )
+        assert response.status_code == 201
+        task_id = response.json()["id"]
+        succeeded = wait_for_task(client, task_id, "SUCCEEDED", worker, timeout=8)
+        assert succeeded["attempt_count"] == 3
+        assert succeeded["result"] == {"succeeded_on_attempt": 3}
+
+        with schema_connection(schema_name) as connection:
+            attempts = connection.execute(
+                """
+                SELECT attempt_number, status::text, leased_at, finished_at, error
+                FROM task_attempts
+                WHERE task_id = %s
+                ORDER BY attempt_number
+                """,
+                (task_id,),
+            ).fetchall()
+        assert [(row[0], row[1]) for row in attempts] == [
+            (1, "FAILED"),
+            (2, "FAILED"),
+            (3, "SUCCEEDED"),
+        ]
+        first_wait = (attempts[1][2] - attempts[0][3]).total_seconds()
+        second_wait = (attempts[2][2] - attempts[1][3]).total_seconds()
+        assert first_wait >= 0.09
+        assert second_wait >= 0.18
+        assert attempts[0][4] and "attempt 1" in attempts[0][4]
+        assert attempts[1][4] and "attempt 2" in attempts[1][4]
+        print(
+            "RETRY_SUCCESS delays_ms="
+            f"{first_wait * 1000:.1f},{second_wait * 1000:.1f} "
+            "history=FAILED,FAILED,SUCCEEDED"
+        )
+    finally:
+        worker_output = stop_process(worker)
+        scheduler_output = stop_process(scheduler)
+        assert worker.returncode == 0, worker_output
+        assert "task_retry_scheduled" in worker_output, worker_output
+        assert "task_retry_promoted" in scheduler_output, scheduler_output
+
+
+def test_retry_exhaustion_has_no_attempt_four(
+    recovery_environment: tuple[str, TestClient],
+) -> None:
+    schema_name, client = recovery_environment
+    scheduler = start_scheduler(schema_name)
+    worker_instance = f"retry-exhaust-{uuid.uuid4().hex}"
+    worker = start_worker(schema_name, worker_instance)
+    try:
+        wait_for_worker(schema_name, worker_instance, worker)
+        submitted = client.post(
+            "/tasks",
+            json={"task_type": "test.fail_retryable", "max_attempts": 3},
+        ).json()
+        failed = wait_for_task(client, submitted["id"], "FAILED", worker, timeout=8)
+        assert failed["attempt_count"] == 3
+        time.sleep(0.25)
+        history = client.get(f"/tasks/{submitted['id']}/attempts").json()["items"]
+        assert [(item["attempt_number"], item["status"]) for item in history] == [
+            (1, "FAILED"),
+            (2, "FAILED"),
+            (3, "FAILED"),
+        ]
+    finally:
+        worker_output = stop_process(worker)
+        stop_process(scheduler)
+        assert worker.returncode == 0, worker_output
+        assert "task_retry_exhausted" in worker_output, worker_output
+
+
+def test_mixed_retry_and_abandoned_history(
+    recovery_environment: tuple[str, TestClient],
+) -> None:
+    schema_name, client = recovery_environment
+    scheduler = start_scheduler(schema_name)
+    worker_instance = f"retry-mixed-{uuid.uuid4().hex}"
+    worker = start_worker(schema_name, worker_instance)
+    try:
+        wait_for_worker(schema_name, worker_instance, worker)
+        submitted = client.post(
+            "/tasks",
+            json={"task_type": "test.mixed_failure", "max_attempts": 4},
+        ).json()
+        task_id = submitted["id"]
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            task = client.get(f"/tasks/{task_id}").json()
+            if task["status"] == "RUNNING" and task["attempt_count"] == 2:
+                break
+            assert_running(worker, "mixed-failure worker")
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"attempt 2 did not start; last task={task}")
+
+        with schema_connection(schema_name) as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET lease_expires_at = clock_timestamp() - interval '1 millisecond'
+                WHERE id = %s AND attempt_count = 2
+                """,
+                (task_id,),
+            )
+        succeeded = wait_for_task(client, task_id, "SUCCEEDED", worker, timeout=10)
+        assert succeeded["attempt_count"] == 4
+        history = client.get(f"/tasks/{task_id}/attempts").json()["items"]
+        assert [(item["attempt_number"], item["status"]) for item in history] == [
+            (1, "FAILED"),
+            (2, "ABANDONED"),
+            (3, "FAILED"),
+            (4, "SUCCEEDED"),
+        ]
+        assert history[1]["error"] == "lease_expired"
+
+        exhausted = client.post(
+            "/tasks",
+            json={"task_type": "test.mixed_failure", "max_attempts": 3},
+        ).json()
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            exhausted_task = client.get(f"/tasks/{exhausted['id']}").json()
+            if (
+                exhausted_task["status"] == "RUNNING"
+                and exhausted_task["attempt_count"] == 2
+            ):
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"mixed exhaustion attempt 2 did not start: {exhausted_task}")
+        with schema_connection(schema_name) as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET lease_expires_at = clock_timestamp() - interval '1 millisecond'
+                WHERE id = %s AND attempt_count = 2
+                """,
+                (exhausted["id"],),
+            )
+        final_failed = wait_for_task(
+            client, exhausted["id"], "FAILED", worker, timeout=10
+        )
+        assert final_failed["attempt_count"] == 3
+        exhausted_history = client.get(f"/tasks/{exhausted['id']}/attempts").json()[
+            "items"
+        ]
+        assert [item["status"] for item in exhausted_history] == [
+            "FAILED",
+            "ABANDONED",
+            "FAILED",
+        ]
+        print(
+            "MIXED_HISTORY success=FAILED,ABANDONED,FAILED,SUCCEEDED "
+            "exhausted=FAILED,ABANDONED,FAILED"
+        )
+    finally:
+        worker_output = stop_process(worker)
+        scheduler_output = stop_process(scheduler)
+        assert worker.returncode == 0, worker_output
+        assert "task_retry_scheduled" in worker_output, worker_output
+        assert "task_recovered" in scheduler_output, scheduler_output

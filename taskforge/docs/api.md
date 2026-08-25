@@ -14,7 +14,7 @@ Request fields:
 | `payload` | no | JSON object; defaults to an empty object. |
 | `queue` | no | Queue name; defaults to `default`. |
 | `priority` | no | Signed 16-bit value; higher values are claimed first. |
-| `max_attempts` | no | Between 1 and 100; persisted, but retries are not implemented. |
+| `max_attempts` | no | Between 1 and 100; counts every claimed attempt, including failed and abandoned attempts. |
 | `scheduled_at` | no | ISO 8601 timestamp; defaults to database time. |
 | `idempotency_key` | no | Unique within a queue. Duplicate submissions return `409`. |
 
@@ -35,9 +35,9 @@ Results are ordered by newest creation time, then ID.
 
 ## Cancel a task
 
-`POST /tasks/{id}/cancel` atomically transitions only `QUEUED` to `CANCELLED` and sets `completed_at`.
+`POST /tasks/{id}/cancel` atomically transitions `QUEUED` or `RETRYING` to `CANCELLED`, normalizes `scheduled_at`, and sets `completed_at`.
 
-Cancellation is idempotent for an already `CANCELLED` task. Unknown tasks return `404`. `LEASED`, `RUNNING`, `RETRYING`, `SUCCEEDED`, and `FAILED` tasks return `409` without changing task or attempt state.
+Cancellation is idempotent for an already `CANCELLED` task. Unknown tasks return `404`. `LEASED`, `RUNNING`, `SUCCEEDED`, and `FAILED` tasks return `409` without changing task or attempt state. Cancelling `RETRYING` changes no attempt history and prevents later scheduler promotion.
 
 This endpoint changes lifecycle state only. It does not execute tasks or implement worker behavior.
 
@@ -47,7 +47,7 @@ Task responses expose `claimed_by_worker_id` and `lease_expires_at`. Both are no
 
 `GET /tasks/{id}/attempts` returns `{ "items": [...] }` with durable attempt history ordered by `attempt_number` ascending. Unknown tasks return `404`; a task with no attempts returns an empty list.
 
-Each item includes `id`, `task_id`, `worker_id`, `attempt_number`, `status`, `leased_at`, `started_at`, `finished_at`, `output`, `error`, `created_at`, and `updated_at`. `ABANDONED` identifies crash/lease-loss recovery and uses the stable `lease_expired` error. Internal ownership secrets are not exposed.
+Each item includes `id`, `task_id`, `worker_id`, `attempt_number`, `status`, `leased_at`, `started_at`, `finished_at`, `output`, `error`, `created_at`, and `updated_at`. `FAILED` records a handler error; `ABANDONED` identifies lease-loss recovery with `lease_expired`. Internal ownership secrets are not exposed.
 
 ## List workers
 

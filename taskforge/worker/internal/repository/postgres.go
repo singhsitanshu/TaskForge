@@ -202,6 +202,153 @@ func (r *Postgres) RenewLease(
 	return leaseExpiresAt, nil
 }
 
+func (r *Postgres) RetryableFail(
+	ctx context.Context,
+	workerID string,
+	task *domain.ClaimedTask,
+	executionErr error,
+	retryDelay time.Duration,
+) (domain.RetryOutcome, error) {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.RetryOutcome{}, fmt.Errorf("begin retry failure transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	const selectState = `
+		SELECT
+			status::text,
+			COALESCE(claimed_by_worker_id::text, ''),
+			attempt_count,
+			max_attempts,
+			COALESCE(lease_expires_at > clock_timestamp(), false)
+		FROM tasks
+		WHERE id = $1::uuid
+		FOR UPDATE
+	`
+	var taskStatus, claimedBy string
+	var attemptNumber, maxAttempts int16
+	var leaseValid bool
+	if err := tx.QueryRow(ctx, selectState, task.ID).Scan(
+		&taskStatus,
+		&claimedBy,
+		&attemptNumber,
+		&maxAttempts,
+		&leaseValid,
+	); err != nil {
+		return domain.RetryOutcome{}, fmt.Errorf("lock task for retry failure: %w", err)
+	}
+	if taskStatus != "RUNNING" || claimedBy != workerID ||
+		attemptNumber != task.AttemptNumber || !leaseValid {
+		return domain.RetryOutcome{}, fmt.Errorf(
+			"%w: task=%s worker=%s attempt=%d status=%s claimed_by=%s current_attempt=%d lease_valid=%t",
+			domain.ErrLeaseLost,
+			task.ID,
+			workerID,
+			task.AttemptNumber,
+			taskStatus,
+			claimedBy,
+			attemptNumber,
+			leaseValid,
+		)
+	}
+
+	message := executionErr.Error()
+	commandTag, err := tx.Exec(ctx, `
+		UPDATE task_attempts
+		SET
+			status = 'FAILED',
+			finished_at = clock_timestamp(),
+			output = NULL,
+			error = $5
+		WHERE id = $1::uuid
+		  AND task_id = $2::uuid
+		  AND worker_id = $3::uuid
+		  AND attempt_number = $4
+		  AND status = 'RUNNING'
+	`, task.AttemptID, task.ID, workerID, task.AttemptNumber, message)
+	if err != nil {
+		return domain.RetryOutcome{}, fmt.Errorf("mark retryable attempt failed: %w", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return domain.RetryOutcome{}, domain.ErrLeaseLost
+	}
+
+	outcome := domain.RetryOutcome{Delay: retryDelay}
+	if attemptNumber < maxAttempts {
+		const scheduleRetry = `
+			UPDATE tasks
+			SET
+				status = 'RETRYING',
+				claimed_by_worker_id = NULL,
+				lease_expires_at = NULL,
+				completed_at = NULL,
+				result = NULL,
+				last_error = $4,
+				scheduled_at = clock_timestamp() + $5 * interval '1 microsecond'
+			WHERE id = $1::uuid
+			  AND status = 'RUNNING'
+			  AND claimed_by_worker_id = $2::uuid
+			  AND attempt_count = $3
+			  AND lease_expires_at > clock_timestamp()
+			RETURNING scheduled_at
+		`
+		if err := tx.QueryRow(
+			ctx,
+			scheduleRetry,
+			task.ID,
+			workerID,
+			task.AttemptNumber,
+			message,
+			retryDelay.Microseconds(),
+		).Scan(&outcome.RetryAt); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.RetryOutcome{}, domain.ErrLeaseLost
+			}
+			return domain.RetryOutcome{}, fmt.Errorf("schedule task retry: %w", err)
+		}
+	} else {
+		outcome.Exhausted = true
+		const exhaustRetry = `
+			UPDATE tasks
+			SET
+				status = 'FAILED',
+				claimed_by_worker_id = NULL,
+				lease_expires_at = NULL,
+				completed_at = clock_timestamp(),
+				result = NULL,
+				last_error = $4,
+				scheduled_at = clock_timestamp()
+			WHERE id = $1::uuid
+			  AND status = 'RUNNING'
+			  AND claimed_by_worker_id = $2::uuid
+			  AND attempt_count = $3
+			  AND lease_expires_at > clock_timestamp()
+		`
+		commandTag, err = tx.Exec(
+			ctx,
+			exhaustRetry,
+			task.ID,
+			workerID,
+			task.AttemptNumber,
+			message,
+		)
+		if err != nil {
+			return domain.RetryOutcome{}, fmt.Errorf("exhaust task retries: %w", err)
+		}
+		if commandTag.RowsAffected() != 1 {
+			return domain.RetryOutcome{}, domain.ErrLeaseLost
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.RetryOutcome{}, fmt.Errorf("commit retry failure: %w", err)
+	}
+	return outcome, nil
+}
+
 func (r *Postgres) Complete(
 	ctx context.Context,
 	workerID string,

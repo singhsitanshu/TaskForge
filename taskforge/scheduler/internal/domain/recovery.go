@@ -34,3 +34,9 @@ type RecoveryBatch struct {
 	Recovered  []RecoveredTask
 	Violations []InvariantViolation
 }
+
+type PromotedTask struct {
+	TaskID        string
+	AttemptNumber int16
+	ScheduledAt   time.Time
+}

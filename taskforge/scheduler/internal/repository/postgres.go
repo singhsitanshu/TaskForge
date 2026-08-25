@@ -35,6 +35,57 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 	return &Postgres{pool: pool}
 }
 
+func (repository *Postgres) PromoteDueRetries(
+	ctx context.Context,
+	batchSize int,
+) ([]domain.PromotedTask, error) {
+	tx, err := repository.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("begin retry promotion transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	const query = `
+		WITH due AS MATERIALIZED (
+			SELECT id
+			FROM tasks
+			WHERE status = 'RETRYING'
+			  AND scheduled_at <= clock_timestamp()
+			ORDER BY scheduled_at ASC, id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT $1
+		)
+		UPDATE tasks AS task
+		SET status = 'QUEUED'
+		FROM due
+		WHERE task.id = due.id
+		  AND task.status = 'RETRYING'
+		RETURNING task.id::text, task.attempt_count, task.scheduled_at
+	`
+	rows, err := tx.Query(ctx, query, batchSize)
+	if err != nil {
+		return nil, fmt.Errorf("promote due retries: %w", err)
+	}
+	promoted := make([]domain.PromotedTask, 0, batchSize)
+	for rows.Next() {
+		var task domain.PromotedTask
+		if err := rows.Scan(&task.TaskID, &task.AttemptNumber, &task.ScheduledAt); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan promoted retry: %w", err)
+		}
+		promoted = append(promoted, task)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("read promoted retries: %w", err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit retry promotion: %w", err)
+	}
+	return promoted, nil
+}
+
 func (repository *Postgres) RecoverExpired(
 	ctx context.Context,
 	batchSize int,

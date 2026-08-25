@@ -37,6 +37,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	promotionConfig, err := config.RetryPromotionFromEnv()
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -57,11 +61,13 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("connect to database: %w", err)
 	}
 
+	store := repository.NewPostgres(pool)
 	recovery := service.NewRecovery(
-		repository.NewPostgres(pool),
+		store,
 		recoveryConfig,
 		logger,
 	)
+	promotion := service.NewRetryPromotion(store, promotionConfig, logger)
 	server := &http.Server{
 		Addr:              envOrDefault("HTTP_ADDR", ":8080"),
 		Handler:           newMux(),
@@ -77,6 +83,9 @@ func run(logger *slog.Logger) error {
 			"recovery_interval", recoveryConfig.Interval,
 			"recovery_batch_size", recoveryConfig.BatchSize,
 			"recovery_db_timeout", recoveryConfig.DBTimeout,
+			"retry_promotion_interval", promotionConfig.Interval,
+			"retry_promotion_batch_size", promotionConfig.BatchSize,
+			"retry_promotion_db_timeout", promotionConfig.DBTimeout,
 		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrors <- err
@@ -84,10 +93,14 @@ func run(logger *slog.Logger) error {
 	}()
 
 	var lifecycle sync.WaitGroup
-	lifecycle.Add(1)
+	lifecycle.Add(2)
 	go func() {
 		defer lifecycle.Done()
 		recovery.Run(ctx)
+	}()
+	go func() {
+		defer lifecycle.Done()
+		promotion.Run(ctx)
 	}()
 
 	var runErr error

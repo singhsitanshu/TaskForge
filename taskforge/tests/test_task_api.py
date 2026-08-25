@@ -237,6 +237,69 @@ def test_cancel_running_task_returns_conflict_and_preserves_attempt(
     assert attempt == ("RUNNING", None)
 
 
+def test_cancel_retrying_task_prevents_future_promotion(
+    api_client: TestClient,
+    database_schema: str,
+) -> None:
+    submitted = api_client.post(
+        "/tasks",
+        json={"task_type": "waiting.retry", "max_attempts": 3},
+    ).json()
+    with database_connection(database_schema) as connection:
+        worker_id = connection.execute(
+            """
+            INSERT INTO workers (instance_id, name)
+            VALUES (%s, 'retry cancellation worker')
+            RETURNING id
+            """,
+            (f"retry-cancel-{uuid.uuid4().hex}",),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            UPDATE tasks
+            SET
+                status = 'RETRYING',
+                attempt_count = 1,
+                scheduled_at = clock_timestamp() + interval '1 hour',
+                last_error = 'temporary failure'
+            WHERE id = %s
+            """,
+            (submitted["id"],),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_attempts (
+                task_id, worker_id, attempt_number, status,
+                started_at, finished_at, error
+            )
+            VALUES (
+                %s, %s, 1, 'FAILED',
+                clock_timestamp(), clock_timestamp(), 'temporary failure'
+            )
+            """,
+            (submitted["id"], worker_id),
+        )
+
+    response = api_client.post(f"/tasks/{submitted['id']}/cancel")
+    assert response.status_code == 200
+    cancelled = response.json()
+    assert cancelled["status"] == "CANCELLED"
+    assert cancelled["attempt_count"] == 1
+    assert cancelled["completed_at"] is not None
+    assert cancelled["scheduled_at"] <= cancelled["completed_at"]
+
+    with database_connection(database_schema) as connection:
+        attempt = connection.execute(
+            """
+            SELECT status::text, error
+            FROM task_attempts
+            WHERE task_id = %s
+            """,
+            (submitted["id"],),
+        ).fetchone()
+    assert attempt == ("FAILED", "temporary failure")
+
+
 def test_unknown_tasks_return_not_found(api_client: TestClient) -> None:
     task_id = uuid.uuid4()
     assert api_client.get(f"/tasks/{task_id}").status_code == 404

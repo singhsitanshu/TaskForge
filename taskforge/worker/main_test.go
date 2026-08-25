@@ -90,3 +90,18 @@ func TestResolveLeaseConfiguration(t *testing.T) {
 		t.Fatalf("unexpected lease configuration: %#v", configuration)
 	}
 }
+
+func TestResolveRetryConfiguration(t *testing.T) {
+	t.Setenv("TASK_RETRY_BASE_DELAY", "100ms")
+	t.Setenv("TASK_RETRY_MAX_DELAY", "400ms")
+	t.Setenv("TASK_RETRY_JITTER", "0")
+	configuration, err := resolveRetryConfig()
+	if err != nil {
+		t.Fatalf("resolve retry configuration: %v", err)
+	}
+	if configuration.BaseDelay != 100*time.Millisecond ||
+		configuration.MaxDelay != 400*time.Millisecond ||
+		configuration.Jitter != 0 {
+		t.Fatalf("unexpected retry configuration: %+v", configuration)
+	}
+}

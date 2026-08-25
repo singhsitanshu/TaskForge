@@ -2,7 +2,7 @@
 
 ## Scope
 
-TaskForge currently provides task submission, predefined Go worker handlers, durable worker heartbeats, renewable task leases, and scheduler-driven recovery of expired ownership. PostgreSQL is authoritative for every lifecycle transition. Ordinary handler retries, retry backoff, schedule evaluation, Redis dispatch, and arbitrary task execution remain out of scope.
+TaskForge currently provides task submission, predefined Go worker handlers, durable worker heartbeats, renewable task leases, expired-ownership recovery, and typed handler retries with delayed exponential backoff. PostgreSQL is authoritative for every lifecycle transition. Recurring schedule evaluation, Redis dispatch, and arbitrary task execution remain out of scope.
 
 ## Service boundaries
 
@@ -12,20 +12,24 @@ The React/TypeScript application is the browser-facing interface. It is built as
 
 ### API (`api`)
 
-FastAPI is the public control-plane boundary. It validates submissions, reads task and ordered attempt history, permits queued-task cancellation, and derives worker liveness for operators. It does not dispatch or execute work. PostgreSQL is the source of every API response.
+FastAPI is the public control-plane boundary. It validates submissions, reads task and ordered attempt history, permits cancellation of unowned `QUEUED` and `RETRYING` work, and derives worker liveness for operators. It does not dispatch or execute work. PostgreSQL is the source of every API response.
 
 ### Scheduler (`scheduler`)
 
-The Go scheduler owns system-driven lifecycle maintenance. Its TF-008 recovery loop:
+The Go scheduler owns two independent lifecycle-maintenance loops:
 
     Scheduler
-    `-- Recovery Loop
+    |-- Recovery Loop
         |-- find expired RUNNING tasks
         |-- lock each task with FOR UPDATE SKIP LOCKED
         |-- validate and mark its current attempt ABANDONED
-        `-- requeue the task or fail it at max_attempts
+    |   `-- requeue the task or fail it at max_attempts
+    `-- Retry Promotion Loop
+        |-- find due RETRYING tasks
+        |-- lock with FOR UPDATE SKIP LOCKED
+        `-- promote to QUEUED without creating attempts
 
-Each scan has a bounded batch and database timeout. Any scheduler replica may scan; PostgreSQL row locking coordinates replicas without leader election. Recovery uses only `tasks.lease_expires_at <= clock_timestamp()`. Worker heartbeat/liveness never grants or revokes task ownership.
+Each scan has its own bounded batch, ticker, and database timeout. Any scheduler replica may run both; PostgreSQL row locking coordinates replicas without leader election. Recovery uses task leases, while retry promotion uses `scheduled_at`. Worker liveness affects neither.
 
 The scheduler exposes only the internal operational `/healthz` endpoint. Schedule evaluation and Redis publication are future responsibilities.
 
@@ -33,7 +37,7 @@ The scheduler exposes only the internal operational `/healthz` endpoint. Schedul
 
 The Go worker registers a process-lifetime identity, heartbeats independently, polls eligible `QUEUED` rows, atomically claims one task, creates its next numbered attempt, runs an allowlisted handler, renews its lease, and atomically records success or failure. Claim order is priority descending, creation time ascending, then task ID ascending. `FOR UPDATE SKIP LOCKED` coordinates simultaneous workers.
 
-The handler registry contains `test.echo`, `test.fail`, and bounded `test.sleep`. Unknown task types fail safely; task payloads never become executable commands or code.
+Handlers receive minimal task/attempt/worker execution metadata and explicitly return typed retryable errors or ordinary terminal errors. Unknown task types and malformed payloads fail terminally; task payloads never become executable commands or code.
 
 Each process separates liveness from ownership:
 
@@ -43,11 +47,11 @@ Each process separates liveness from ownership:
           |-- handler
           `-- lease renewal ------> tasks.lease_expires_at
 
-Renewal and completion require the same task, worker, attempt number, `RUNNING` status, and a strictly unexpired lease. Once the scheduler recovers a task, the old worker cannot renew, succeed, or fail it. A later claim creates attempt `N+1`; recovery itself never creates an attempt.
+Renewal, completion, and retry scheduling require the same task, worker, attempt number, `RUNNING` status, and a strictly unexpired lease. Retryable failure atomically records a `FAILED` attempt and `RETRYING` task. Once recovery or retry transition clears ownership, the old worker cannot mutate it. Only a later claim creates attempt `N+1`.
 
 ### PostgreSQL (`postgres`)
 
-PostgreSQL is the durable coordination mechanism and system of record for tasks, attempts, workers, ownership, results, and recovery. Claim, completion, and recovery each use explicit transactions. Migrations own all schema evolution.
+PostgreSQL is the durable coordination mechanism and system of record for tasks, attempts, workers, ownership, results, retries, and recovery. Claim, completion, retry failure, promotion, and recovery use atomic database transactions.
 
 ### Redis (`redis`)
 
@@ -61,8 +65,8 @@ Redis is provisioned for future transient dispatch and coordination. It is not o
                                                   PostgreSQL
                                                    ^   ^   ^
                                                    |   |   |
-                         poll / claim / renew ------+   |   +------ expired-lease scan
-                         attempts / completion         |           and recovery
+                         poll / claim / renew ------+   |   +------ recovery and
+                         attempts / completion / retry  |           retry promotion
                                                        |                |
                                                     Worker          Scheduler
 
@@ -70,11 +74,11 @@ Redis is provisioned for future transient dispatch and coordination. It is not o
 
 Containers use Compose internal DNS. API and web development ports are host-published. Worker and scheduler health endpoints remain internal, so replicas do not compete for host ports.
 
-## Recovery concurrency and failure model
+## Scheduler concurrency and failure model
 
 The expired-task query is ordered by lease expiration and uses the partial `tasks_running_lease_idx`. A scanner locks at most its configured batch with `FOR UPDATE SKIP LOCKED`. For every locked task it locks the attempt at `(task_id, attempt_count)` and verifies worker, number, and `RUNNING` status.
 
-Attempt abandonment and task requeue/failure are in the same transaction. A database error rolls back both. A missing or mismatched attempt is reported as `task_recovery_invariant_violation` and left untouched; the scheduler never guesses at corrupted history. Transient scan failures are logged and retried at the next interval without a busy loop.
+Attempt abandonment and task requeue/failure are in one transaction. Retry promotion separately uses `tasks_retry_due_idx` and atomically changes only due `RETRYING` rows to `QUEUED`. Neither maintenance action creates an attempt. Transient failures are retried on the appropriate next interval without a busy loop.
 
 ## Health and startup
 
@@ -96,7 +100,7 @@ HTTP health reports process availability. Worker `ACTIVE`/`STALE`/`DEAD` is sepa
 
 ## Observability
 
-Services log to standard output. Scheduler recovery logs include the event, task, former worker, attempt number, lease expiration, and action. Empty scans are DEBUG-only. Metrics, dashboards, and alerting are intentionally deferred.
+Services log to standard output. Retry scheduling, exhaustion, promotion, recovery, and invariant errors use structured event fields. Empty scheduler scans are DEBUG-only. Metrics, dashboards, and alerting are intentionally deferred.
 
 ## Repository layout
 

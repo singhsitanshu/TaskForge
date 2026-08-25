@@ -513,7 +513,16 @@ func runWorkload(t *testing.T, database *testDatabase, workers []testWorker) wor
 			<-releaseExecution
 			claimedCount := 0
 			for err == nil && task != nil {
-				output, executionErr := registry.Execute(ctx, task.Type, task.Payload)
+				output, executionErr := registry.Execute(
+					ctx,
+					task.Type,
+					task.Payload,
+					domain.ExecutionMetadata{
+						TaskID:        task.ID,
+						AttemptNumber: task.AttemptNumber,
+						WorkerID:      worker.ID,
+					},
+				)
 				if executionErr != nil {
 					err = fmt.Errorf("execute task %s: %w", task.ID, executionErr)
 					break

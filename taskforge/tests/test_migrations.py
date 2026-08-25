@@ -80,6 +80,7 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 "000003_pre_tf005_remediation",
                 "000004_task_leases",
                 "000005_expired_lease_recovery",
+                "000006_task_retries",
             ]
 
             statuses = [
@@ -116,6 +117,7 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 "workers_available_idx",
                 "workers_name_idx",
                 "task_attempts_finished_idx",
+                "tasks_retry_due_idx",
             } <= indexes
 
             worker_id = fetch_scalar(

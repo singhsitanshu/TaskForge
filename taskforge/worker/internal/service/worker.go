@@ -27,11 +27,25 @@ type Store interface {
 		map[string]any,
 		error,
 	) error
+	RetryableFail(
+		context.Context,
+		string,
+		*domain.ClaimedTask,
+		error,
+		time.Duration,
+	) (domain.RetryOutcome, error)
 }
 
 type Executor interface {
-	Execute(context.Context, string, json.RawMessage) (map[string]any, error)
+	Execute(
+		context.Context,
+		string,
+		json.RawMessage,
+		domain.ExecutionMetadata,
+	) (map[string]any, error)
 }
+
+type RetryDelay func(retryIndex int) time.Duration
 
 type Worker struct {
 	store              Store
@@ -42,6 +56,7 @@ type Worker struct {
 	leaseDuration      time.Duration
 	leaseRenewInterval time.Duration
 	leaseRenewTimeout  time.Duration
+	retryDelay         RetryDelay
 	logger             *log.Logger
 }
 
@@ -55,7 +70,12 @@ func New(
 	leaseRenewInterval time.Duration,
 	leaseRenewTimeout time.Duration,
 	logger *log.Logger,
+	retryDelays ...RetryDelay,
 ) *Worker {
+	retryDelay := RetryDelay(func(_ int) time.Duration { return 2 * time.Second })
+	if len(retryDelays) > 0 && retryDelays[0] != nil {
+		retryDelay = retryDelays[0]
+	}
 	return &Worker{
 		store:              store,
 		executor:           executor,
@@ -65,6 +85,7 @@ func New(
 		leaseDuration:      leaseDuration,
 		leaseRenewInterval: leaseRenewInterval,
 		leaseRenewTimeout:  leaseRenewTimeout,
+		retryDelay:         retryDelay,
 		logger:             logger,
 	}
 }
@@ -123,10 +144,70 @@ func (w *Worker) executeClaimedTask(ctx context.Context, task *domain.ClaimedTas
 		)
 	}()
 
-	result, executionErr := w.executor.Execute(handlerContext, task.Type, task.Payload)
+	result, executionErr := w.executor.Execute(
+		handlerContext,
+		task.Type,
+		task.Payload,
+		domain.ExecutionMetadata{
+			TaskID:        task.ID,
+			AttemptNumber: task.AttemptNumber,
+			WorkerID:      w.workerID,
+		},
+	)
 	stopRenewal()
 	renewalErr := <-renewalResult
 	if errors.Is(renewalErr, domain.ErrLeaseLost) {
+		return
+	}
+	if domain.IsRetryable(executionErr) {
+		retryDelay := w.retryDelay(int(task.AttemptNumber) - 1)
+		outcome, err := w.store.RetryableFail(
+			ctx,
+			w.workerID,
+			task,
+			executionErr,
+			retryDelay,
+		)
+		if err != nil {
+			if errors.Is(err, domain.ErrLeaseLost) {
+				w.logger.Printf(
+					"event=task_retry_rejected_stale_owner worker_instance_id=%s worker_id=%s task_id=%s attempt_number=%d error=%q",
+					w.instanceID,
+					w.workerID,
+					task.ID,
+					task.AttemptNumber,
+					err,
+				)
+				return
+			}
+			w.logger.Printf(
+				"event=task_retry_schedule_failed worker_instance_id=%s task_id=%s attempt_number=%d error=%q",
+				w.instanceID,
+				task.ID,
+				task.AttemptNumber,
+				err,
+			)
+			return
+		}
+		if outcome.Exhausted {
+			w.logger.Printf(
+				"event=task_retry_exhausted worker_instance_id=%s task_id=%s attempt_number=%d error=%q",
+				w.instanceID,
+				task.ID,
+				task.AttemptNumber,
+				executionErr,
+			)
+			return
+		}
+		w.logger.Printf(
+			"event=task_retry_scheduled worker_instance_id=%s task_id=%s attempt_number=%d retry_at=%s retry_delay=%s error=%q",
+			w.instanceID,
+			task.ID,
+			task.AttemptNumber,
+			outcome.RetryAt.Format(time.RFC3339Nano),
+			outcome.Delay,
+			executionErr,
+		)
 		return
 	}
 
