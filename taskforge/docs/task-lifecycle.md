@@ -14,9 +14,9 @@ PostgreSQL defines the task lifecycle with the `task_status` enum.
 
 ## First worker transitions
 
-The first worker implements only `QUEUED -> RUNNING -> SUCCEEDED|FAILED`. Claiming creates exactly one `RUNNING` attempt and stores `claimed_by_worker_id`; completion updates the task and attempt in one transaction and clears the claim. Cancellation may move a waiting or running task to `CANCELLED`.
+The first worker implements only `QUEUED -> RUNNING -> SUCCEEDED|FAILED`. Claiming creates exactly one `RUNNING` attempt and stores `claimed_by_worker_id`; completion updates the task and attempt in one transaction and clears the claim. The API permits only `QUEUED -> CANCELLED`; cancellation of any other state returns a conflict until worker cancellation signaling exists.
 
-Retries and `RETRYING` transitions are not implemented. The worker also does not create leases or use priority when selecting work.
+Retries and `RETRYING` transitions are not implemented. The worker does not create leases. Eligible queued tasks are claimed by priority descending, then creation time and task ID ascending.
 
 ## Database invariants
 

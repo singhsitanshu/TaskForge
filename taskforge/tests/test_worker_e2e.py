@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -123,6 +124,7 @@ def test_api_submission_worker_execution_and_poll_again(
         {
             "DATABASE_URL": os.environ["TEST_DATABASE_URL"],
             "PGOPTIONS": f"-csearch_path={schema_name}",
+            "WORKER_ID": worker_name,
             "WORKER_NAME": worker_name,
             "POLL_INTERVAL": "20ms",
             "HTTP_ADDR": "127.0.0.1:0",
@@ -203,3 +205,126 @@ def test_api_submission_worker_execution_and_poll_again(
     finally:
         output = stop_worker(process)
         assert process.returncode == 0, output
+
+
+def test_worker_claims_by_priority_age_and_id(
+    worker_environment: tuple[str, TestClient],
+) -> None:
+    schema_name, client = worker_environment
+    same_created_at = "2026-01-01T00:00:00+00:00"
+    ordered_tasks = [
+        (
+            uuid.UUID("00000000-0000-0000-0000-000000000100"),
+            "priority-100",
+            100,
+            "2026-01-03T00:00:00+00:00",
+        ),
+        (
+            uuid.UUID("00000000-0000-0000-0000-000000000075"),
+            "priority-75-older",
+            75,
+            "2026-01-01T00:00:00+00:00",
+        ),
+        (
+            uuid.UUID("00000000-0000-0000-0000-000000000076"),
+            "priority-75-newer",
+            75,
+            "2026-01-02T00:00:00+00:00",
+        ),
+        (
+            uuid.UUID("00000000-0000-0000-0000-000000000001"),
+            "priority-60-id-1",
+            60,
+            same_created_at,
+        ),
+        (
+            uuid.UUID("00000000-0000-0000-0000-000000000002"),
+            "priority-60-id-2",
+            60,
+            same_created_at,
+        ),
+        (
+            uuid.UUID("00000000-0000-0000-0000-000000000050"),
+            "priority-50",
+            50,
+            "2026-01-01T00:00:00+00:00",
+        ),
+        (
+            uuid.UUID("00000000-0000-0000-0000-000000000010"),
+            "priority-1",
+            1,
+            "2026-01-01T00:00:00+00:00",
+        ),
+    ]
+    excluded_tasks = [
+        (uuid.UUID("00000000-0000-0000-0000-000000000200"), "cancelled", "CANCELLED"),
+        (uuid.UUID("00000000-0000-0000-0000-000000000201"), "succeeded", "SUCCEEDED"),
+    ]
+
+    with schema_connection(schema_name) as connection:
+        for task_id, label, priority, created_at in ordered_tasks:
+            connection.execute(
+                """
+                INSERT INTO tasks (id, task_type, payload, priority, created_at)
+                VALUES (%s, 'test.echo', %s::jsonb, %s, %s::timestamptz)
+                """,
+                (task_id, f'{{"label": "{label}"}}', priority, created_at),
+            )
+        for task_id, label, task_status in excluded_tasks:
+            connection.execute(
+                """
+                INSERT INTO tasks (
+                    id,
+                    task_type,
+                    payload,
+                    status,
+                    priority,
+                    completed_at
+                )
+                VALUES (%s, 'test.echo', %s::jsonb, %s, 32767, clock_timestamp())
+                """,
+                (task_id, f'{{"label": "{label}"}}', task_status),
+            )
+
+    worker_name = f"priority-worker-{uuid.uuid4().hex}"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DATABASE_URL": os.environ["TEST_DATABASE_URL"],
+            "PGOPTIONS": f"-csearch_path={schema_name}",
+            "WORKER_ID": worker_name,
+            "WORKER_NAME": "priority-test-worker",
+            "POLL_INTERVAL": "20ms",
+            "HTTP_ADDR": "127.0.0.1:0",
+        }
+    )
+    process = subprocess.Popen(
+        ["taskforge-worker"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    output = ""
+    try:
+        wait_for_worker_registration(schema_name, "priority-test-worker", process)
+        for task_id, _, _, _ in ordered_tasks:
+            wait_for_status(client, str(task_id), "SUCCEEDED", process)
+    finally:
+        output = stop_worker(process)
+        assert process.returncode == 0, output
+
+    executed_ids = re.findall(r"executing task id=([0-9a-f-]+)", output)
+    assert executed_ids == [str(task_id) for task_id, _, _, _ in ordered_tasks]
+
+    with schema_connection(schema_name) as connection:
+        excluded_attempts = connection.execute(
+            """
+            SELECT count(*)
+            FROM task_attempts
+            WHERE task_id = ANY(%s::uuid[])
+            """,
+            ([str(task_id) for task_id, _, _ in excluded_tasks],),
+        ).fetchone()[0]
+    assert excluded_attempts == 0

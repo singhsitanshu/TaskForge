@@ -1,5 +1,12 @@
 BEGIN;
 
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version varchar(255) PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+
+    CONSTRAINT schema_migrations_version_not_blank CHECK (btrim(version) <> '')
+);
+
 CREATE TYPE task_status AS ENUM (
     'QUEUED',
     'LEASED',
@@ -195,5 +202,8 @@ CREATE TRIGGER task_attempts_set_updated_at
 BEFORE UPDATE ON task_attempts
 FOR EACH ROW
 EXECUTE FUNCTION set_updated_at();
+
+INSERT INTO schema_migrations (version)
+VALUES ('000001_tasks_workers_attempts');
 
 COMMIT;

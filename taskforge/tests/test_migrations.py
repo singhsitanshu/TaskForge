@@ -51,12 +51,29 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                     SELECT table_name
                     FROM information_schema.tables
                     WHERE table_schema = %s
-                      AND table_name IN ('tasks', 'workers', 'task_attempts')
+                      AND table_name IN (
+                          'schema_migrations',
+                          'tasks',
+                          'workers',
+                          'task_attempts'
+                      )
                     """,
                     (schema_name,),
                 )
             }
-            assert tables == {"tasks", "workers", "task_attempts"}
+            assert tables == {"schema_migrations", "tasks", "workers", "task_attempts"}
+
+            applied_versions = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                )
+            ]
+            assert applied_versions == [
+                "000001_tasks_workers_attempts",
+                "000002_first_worker_claim",
+                "000003_pre_tf005_remediation",
+            ]
 
             statuses = [
                 row[0]
@@ -89,16 +106,31 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 "tasks_status_updated_idx",
                 "tasks_lease_token_unique",
                 "tasks_claimed_worker_idx",
+                "tasks_claim_priority_idx",
                 "workers_available_idx",
+                "workers_name_idx",
                 "task_attempts_worker_active_idx",
                 "task_attempts_finished_idx",
             } <= indexes
 
             worker_id = fetch_scalar(
                 connection,
-                "INSERT INTO workers (name) VALUES (%s) RETURNING id",
-                ("migration-test-worker",),
+                """
+                INSERT INTO workers (instance_id, name)
+                VALUES (%s, %s)
+                RETURNING id
+                """,
+                ("migration-test-instance", "migration-test-worker"),
             )
+
+            with pytest.raises(errors.UniqueViolation):
+                connection.execute(
+                    """
+                    INSERT INTO workers (instance_id, name)
+                    VALUES (%s, %s)
+                    """,
+                    ("migration-test-instance", "another-display-name"),
+                )
             task_id = fetch_scalar(
                 connection,
                 """
@@ -213,6 +245,7 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
             assert fetch_scalar(connection, "SELECT to_regclass('tasks')") is None
             assert fetch_scalar(connection, "SELECT to_regclass('workers')") is None
             assert fetch_scalar(connection, "SELECT to_regclass('task_attempts')") is None
+            assert fetch_scalar(connection, "SELECT to_regclass('schema_migrations')") is None
             assert fetch_scalar(connection, "SELECT to_regtype('task_status')") is None
             assert fetch_scalar(connection, "SELECT to_regprocedure('set_updated_at()')") is None
         finally:

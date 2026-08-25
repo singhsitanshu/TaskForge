@@ -20,17 +20,21 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 	return &Postgres{pool: pool}
 }
 
-func (r *Postgres) RegisterWorker(ctx context.Context, name string) (string, error) {
+func (r *Postgres) RegisterWorker(
+	ctx context.Context,
+	instanceID string,
+	name string,
+) (string, error) {
 	const query = `
-		INSERT INTO workers (name, enabled)
-		VALUES ($1, true)
-		ON CONFLICT (name)
-		DO UPDATE SET enabled = true
+		INSERT INTO workers (instance_id, name, enabled)
+		VALUES ($1, $2, true)
+		ON CONFLICT (instance_id)
+		DO UPDATE SET name = EXCLUDED.name, enabled = true
 		RETURNING id::text
 	`
 
 	var workerID string
-	if err := r.pool.QueryRow(ctx, query, name).Scan(&workerID); err != nil {
+	if err := r.pool.QueryRow(ctx, query, instanceID, name).Scan(&workerID); err != nil {
 		return "", fmt.Errorf("register worker: %w", err)
 	}
 	return workerID, nil
@@ -54,7 +58,7 @@ func (r *Postgres) ClaimNext(
 		WHERE status = 'QUEUED'
 		  AND scheduled_at <= clock_timestamp()
 		  AND attempt_count < max_attempts
-		ORDER BY created_at, id
+		ORDER BY priority DESC, created_at ASC, id ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
 	`

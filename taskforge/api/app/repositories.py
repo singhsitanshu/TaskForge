@@ -136,13 +136,9 @@ class PostgresTaskRepository:
             UPDATE tasks
             SET
                 status = 'CANCELLED',
-                completed_at = clock_timestamp(),
-                leased_by_worker_id = NULL,
-                lease_token = NULL,
-                lease_expires_at = NULL,
-                claimed_by_worker_id = NULL
+                completed_at = clock_timestamp()
             WHERE id = %s
-              AND status IN ('QUEUED', 'LEASED', 'RUNNING', 'RETRYING')
+              AND status = 'QUEUED'
             RETURNING {_TASK_COLUMNS}
         """
         async with self._pool.connection() as connection:

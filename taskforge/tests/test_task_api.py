@@ -103,6 +103,12 @@ def test_submit_get_list_and_cancel(
     assert listing["offset"] == 0
     assert task_id in {item["id"] for item in listing["items"]}
 
+    with database_connection(database_schema) as connection:
+        attempts_before = connection.execute(
+            "SELECT count(*) FROM task_attempts WHERE task_id = %s",
+            (task_id,),
+        ).fetchone()[0]
+
     cancel_response = api_client.post(f"/tasks/{task_id}/cancel")
     assert cancel_response.status_code == 200
     cancelled = cancel_response.json()
@@ -112,6 +118,13 @@ def test_submit_get_list_and_cancel(
     repeated_cancel = api_client.post(f"/tasks/{task_id}/cancel")
     assert repeated_cancel.status_code == 200
     assert repeated_cancel.json() == cancelled
+
+    with database_connection(database_schema) as connection:
+        attempts_after = connection.execute(
+            "SELECT count(*) FROM task_attempts WHERE task_id = %s",
+            (task_id,),
+        ).fetchone()[0]
+    assert attempts_before == attempts_after == 0
 
 
 def test_idempotency_key_conflict_is_scoped_to_queue(api_client: TestClient) -> None:
@@ -129,28 +142,89 @@ def test_idempotency_key_conflict_is_scoped_to_queue(api_client: TestClient) -> 
     assert api_client.post("/tasks", json=payload).status_code == 201
 
 
+@pytest.mark.parametrize("terminal_status", ["FAILED", "SUCCEEDED"])
 def test_cancel_terminal_task_returns_conflict(
     api_client: TestClient,
     database_schema: str,
+    terminal_status: str,
 ) -> None:
     submitted = api_client.post(
         "/tasks",
-        json={"task_type": "already.finished"},
+        json={"task_type": f"already.{terminal_status.lower()}"},
     ).json()
 
     with database_connection(database_schema) as connection:
         connection.execute(
             """
             UPDATE tasks
-            SET status = 'SUCCEEDED', completed_at = now()
+            SET status = %s, completed_at = now()
             WHERE id = %s
             """,
-            (submitted["id"],),
+            (terminal_status, submitted["id"]),
         )
 
     response = api_client.post(f"/tasks/{submitted['id']}/cancel")
     assert response.status_code == 409
-    assert "SUCCEEDED" in response.json()["detail"]
+    assert terminal_status in response.json()["detail"]
+
+
+def test_cancel_running_task_returns_conflict_and_preserves_attempt(
+    api_client: TestClient,
+    database_schema: str,
+) -> None:
+    submitted = api_client.post(
+        "/tasks",
+        json={"task_type": "currently.running"},
+    ).json()
+
+    with database_connection(database_schema) as connection:
+        worker_id = connection.execute(
+            """
+            INSERT INTO workers (instance_id, name)
+            VALUES (%s, %s)
+            RETURNING id
+            """,
+            (f"api-test-{uuid.uuid4()}", "api-test-running-worker"),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            UPDATE tasks
+            SET status = 'RUNNING', claimed_by_worker_id = %s, attempt_count = 1
+            WHERE id = %s
+            """,
+            (worker_id, submitted["id"]),
+        )
+        attempt_id = connection.execute(
+            """
+            INSERT INTO task_attempts (
+                task_id,
+                worker_id,
+                attempt_number,
+                status,
+                started_at
+            )
+            VALUES (%s, %s, 1, 'RUNNING', clock_timestamp())
+            RETURNING id
+            """,
+            (submitted["id"], worker_id),
+        ).fetchone()[0]
+
+    response = api_client.post(f"/tasks/{submitted['id']}/cancel")
+    assert response.status_code == 409
+    assert "RUNNING" in response.json()["detail"]
+
+    with database_connection(database_schema) as connection:
+        task_status = connection.execute(
+            "SELECT status::text FROM tasks WHERE id = %s",
+            (submitted["id"],),
+        ).fetchone()[0]
+        attempt = connection.execute(
+            "SELECT status::text, finished_at FROM task_attempts WHERE id = %s",
+            (attempt_id,),
+        ).fetchone()
+
+    assert task_status == "RUNNING"
+    assert attempt == ("RUNNING", None)
 
 
 def test_unknown_tasks_return_not_found(api_client: TestClient) -> None:

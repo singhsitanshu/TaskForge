@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,7 +34,7 @@ func run() error {
 		return errors.New("DATABASE_URL is required")
 	}
 
-	workerName, err := resolveWorkerName()
+	identity, err := resolveWorkerIdentity()
 	if err != nil {
 		return err
 	}
@@ -58,11 +60,16 @@ func run() error {
 	}
 
 	store := repository.NewPostgres(pool)
-	workerID, err := store.RegisterWorker(ctx, workerName)
+	workerID, err := store.RegisterWorker(ctx, identity.InstanceID, identity.Name)
 	if err != nil {
 		return err
 	}
-	log.Printf("registered worker id=%s name=%s", workerID, workerName)
+	log.Printf(
+		"registered worker id=%s instance_id=%s name=%s",
+		workerID,
+		identity.InstanceID,
+		identity.Name,
+	)
 
 	worker := workerservice.New(
 		store,
@@ -122,18 +129,52 @@ func newMux() http.Handler {
 	return mux
 }
 
-func resolveWorkerName() (string, error) {
-	if configured := strings.TrimSpace(os.Getenv("WORKER_NAME")); configured != "" {
-		return configured, nil
+type workerIdentity struct {
+	InstanceID string
+	Name       string
+}
+
+func resolveWorkerIdentity() (workerIdentity, error) {
+	instanceID := strings.TrimSpace(os.Getenv("WORKER_ID"))
+	name := strings.TrimSpace(os.Getenv("WORKER_NAME"))
+
+	hostname := ""
+	if instanceID == "" || name == "" {
+		resolvedHostname, err := os.Hostname()
+		if err != nil {
+			return workerIdentity{}, fmt.Errorf("resolve worker hostname: %w", err)
+		}
+		hostname = strings.TrimSpace(resolvedHostname)
+		if hostname == "" {
+			return workerIdentity{}, errors.New(
+				"WORKER_ID and WORKER_NAME, or a non-empty hostname, are required",
+			)
+		}
 	}
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", fmt.Errorf("resolve worker name: %w", err)
+
+	if instanceID == "" {
+		randomBytes := make([]byte, 16)
+		if _, err := rand.Read(randomBytes); err != nil {
+			return workerIdentity{}, fmt.Errorf("generate worker instance id: %w", err)
+		}
+		suffix := "-" + hex.EncodeToString(randomBytes)
+		maxHostnameLength := 255 - len(suffix)
+		if len(hostname) > maxHostnameLength {
+			hostname = hostname[:maxHostnameLength]
+		}
+		instanceID = hostname + suffix
 	}
-	if strings.TrimSpace(hostname) == "" {
-		return "", errors.New("WORKER_NAME or a non-empty hostname is required")
+	if name == "" {
+		name = hostname
 	}
-	return hostname, nil
+	if len(instanceID) > 255 {
+		return workerIdentity{}, errors.New("WORKER_ID must not exceed 255 characters")
+	}
+	if len(name) > 255 {
+		return workerIdentity{}, errors.New("WORKER_NAME must not exceed 255 characters")
+	}
+
+	return workerIdentity{InstanceID: instanceID, Name: name}, nil
 }
 
 func durationEnv(key string, fallback time.Duration) (time.Duration, error) {

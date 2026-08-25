@@ -54,4 +54,7 @@ CREATE INDEX tasks_claimed_worker_idx
     ON tasks (claimed_by_worker_id)
     WHERE status = 'RUNNING';
 
+INSERT INTO schema_migrations (version)
+VALUES ('000002_first_worker_claim');
+
 COMMIT;

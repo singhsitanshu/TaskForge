@@ -15,7 +15,7 @@ logs:
 health:
 	@curl --fail --silent http://localhost:$${API_PORT:-8000}/healthz
 	@curl --fail --silent http://localhost:$${SCHEDULER_PORT:-8081}/healthz
-	@curl --fail --silent http://localhost:$${WORKER_PORT:-8082}/healthz
+	@docker compose exec -T worker wget --quiet --tries=1 --spider http://127.0.0.1:8080/healthz
 	@curl --fail --silent http://localhost:$${WEB_PORT:-3000}/healthz
 	@printf '\nAll HTTP services are healthy.\n'
 
@@ -44,16 +44,10 @@ test:
 	$(MAKE) test-integration
 
 migrate-up:
-	docker compose up -d postgres
-	@for file in migrations/*.up.sql; do \
-		docker compose exec -T postgres psql --set ON_ERROR_STOP=1 --username "$${POSTGRES_USER:-taskforge}" --dbname "$${POSTGRES_DB:-taskforge}" < "$$file"; \
-	done
+	@./scripts/migrate.sh up
 
 migrate-down:
-	docker compose up -d postgres
-	@find migrations -name '*.down.sql' -print | sort -r | while read -r file; do \
-		docker compose exec -T postgres psql --set ON_ERROR_STOP=1 --username "$${POSTGRES_USER:-taskforge}" --dbname "$${POSTGRES_DB:-taskforge}" < "$$file"; \
-	done
+	@./scripts/migrate.sh down
 
 test-integration:
 	docker compose --profile test run --rm --build integration-tests

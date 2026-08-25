@@ -4,7 +4,7 @@ The Docker-backed suite uses a real PostgreSQL server and temporary schemas:
 
 - `test_migrations.py` verifies schema creation, constraints, indexes, and rollback.
 - `test_task_api.py` exercises task submission, retrieval, listing, cancellation, validation, conflicts, idempotency, and persisted `QUEUED` state through the FastAPI application.
-- `test_worker_e2e.py` starts the compiled Go worker and proves API submission through `SUCCEEDED`, repeated polling, and failure reporting.
+- `test_worker_e2e.py` starts the compiled Go worker and proves API submission through `SUCCEEDED`, repeated polling, failure reporting, and deterministic priority ordering.
 
 Run all integration tests:
 

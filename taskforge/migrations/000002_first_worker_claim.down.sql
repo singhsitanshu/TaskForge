@@ -1,5 +1,8 @@
 BEGIN;
 
+ALTER TABLE tasks
+    DROP CONSTRAINT tasks_worker_claim_shape;
+
 UPDATE tasks
 SET
     leased_by_worker_id = claimed_by_worker_id,
@@ -35,7 +38,6 @@ WHERE lease_token IS NULL
 DROP INDEX IF EXISTS tasks_claimed_worker_idx;
 
 ALTER TABLE tasks
-    DROP CONSTRAINT tasks_worker_claim_shape,
     DROP COLUMN claimed_by_worker_id;
 
 ALTER TABLE tasks
@@ -58,5 +60,8 @@ ALTER TABLE tasks
 ALTER TABLE task_attempts
     ALTER COLUMN lease_token SET NOT NULL,
     ALTER COLUMN lease_expires_at SET NOT NULL;
+
+DELETE FROM schema_migrations
+WHERE version = '000002_first_worker_claim';
 
 COMMIT;

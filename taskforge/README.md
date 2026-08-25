@@ -1,6 +1,6 @@
 # TaskForge
 
-TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission and a deliberately small PostgreSQL-polling worker for predefined test handlers. Scheduling, retries, leases, priorities, Redis dispatch, and arbitrary task execution are not implemented.
+TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission and a deliberately small priority-aware PostgreSQL-polling worker for predefined test handlers. Scheduling, retries, leases, Redis dispatch, and arbitrary task execution are not implemented.
 
 ## Services
 
@@ -8,7 +8,7 @@ TaskForge is a service-oriented task orchestration platform. The current milesto
 | --- | --- | ---: | --- |
 | `api` | Python / FastAPI | 8000 | Public task API and task lifecycle ownership |
 | `scheduler` | Go | 8081 | Future schedule evaluation and dispatch coordination |
-| `worker` | Go | 8082 | Polls PostgreSQL and executes registered test handlers |
+| `worker` | Go | internal | Polls PostgreSQL and executes registered test handlers |
 | `web` | React / TypeScript | 3000 | Browser interface |
 | `postgres` | PostgreSQL | 5432 | Durable application state |
 | `redis` | Redis | 6379 | Future queueing and short-lived coordination |

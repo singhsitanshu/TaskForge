@@ -5,6 +5,6 @@ DROP TABLE IF EXISTS tasks;
 DROP TABLE IF EXISTS workers;
 DROP FUNCTION IF EXISTS set_updated_at();
 DROP TYPE IF EXISTS task_status;
+DROP TABLE IF EXISTS schema_migrations;
 
 COMMIT;
-
