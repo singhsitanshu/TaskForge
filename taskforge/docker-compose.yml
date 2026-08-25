@@ -109,6 +109,17 @@ services:
       retries: 5
     restart: unless-stopped
 
+  migration-tests:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    environment:
+      TEST_DATABASE_URL: postgresql://${POSTGRES_USER:-taskforge}:${POSTGRES_PASSWORD:-taskforge}@postgres:5432/${POSTGRES_DB:-taskforge}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["test"]
+
 volumes:
   postgres-data:
   redis-data:

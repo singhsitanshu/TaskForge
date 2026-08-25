@@ -1,0 +1,225 @@
+import os
+import uuid
+from pathlib import Path
+
+import psycopg
+import pytest
+from psycopg import errors, sql
+
+ROOT = Path(__file__).resolve().parents[1]
+UP_SQL = (ROOT / "migrations" / "000001_tasks_workers_attempts.up.sql").read_text()
+DOWN_SQL = (ROOT / "migrations" / "000001_tasks_workers_attempts.down.sql").read_text()
+DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+
+pytestmark = pytest.mark.skipif(
+    not DATABASE_URL,
+    reason="TEST_DATABASE_URL is required for PostgreSQL migration tests",
+)
+
+EXPECTED_STATUSES = [
+    "QUEUED",
+    "LEASED",
+    "RUNNING",
+    "RETRYING",
+    "SUCCEEDED",
+    "FAILED",
+    "CANCELLED",
+]
+
+
+def fetch_scalar(connection: psycopg.Connection, query: str, parameters=()):
+    return connection.execute(query, parameters).fetchone()[0]
+
+
+def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
+    assert DATABASE_URL is not None
+    schema_name = f"migration_test_{uuid.uuid4().hex}"
+
+    with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
+        try:
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            connection.execute(UP_SQL)
+
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_name IN ('tasks', 'workers', 'task_attempts')
+                    """,
+                    (schema_name,),
+                )
+            }
+            assert tables == {"tasks", "workers", "task_attempts"}
+
+            statuses = [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT enumlabel
+                    FROM pg_enum
+                    WHERE enumtypid = 'task_status'::regtype
+                    ORDER BY enumsortorder
+                    """
+                )
+            ]
+            assert statuses == EXPECTED_STATUSES
+
+            indexes = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT indexname
+                    FROM pg_indexes
+                    WHERE schemaname = %s
+                    """,
+                    (schema_name,),
+                )
+            }
+            assert {
+                "tasks_queue_idempotency_key_idx",
+                "tasks_dispatch_idx",
+                "tasks_expired_lease_idx",
+                "tasks_status_updated_idx",
+                "tasks_lease_token_unique",
+                "workers_available_idx",
+                "task_attempts_worker_active_idx",
+                "task_attempts_finished_idx",
+            } <= indexes
+
+            worker_id = fetch_scalar(
+                connection,
+                "INSERT INTO workers (name) VALUES (%s) RETURNING id",
+                ("migration-test-worker",),
+            )
+            task_id = fetch_scalar(
+                connection,
+                """
+                INSERT INTO tasks (queue, task_type, payload)
+                VALUES ('default', 'test.noop', '{"input": "value"}')
+                RETURNING id
+                """,
+            )
+
+            connection.execute(
+                """
+                INSERT INTO tasks (queue, task_type, idempotency_key)
+                VALUES ('critical', 'test.noop', 'same-request')
+                """
+            )
+            with pytest.raises(errors.UniqueViolation):
+                connection.execute(
+                    """
+                    INSERT INTO tasks (queue, task_type, idempotency_key)
+                    VALUES ('critical', 'test.noop', 'same-request')
+                    """
+                )
+
+            with pytest.raises(errors.CheckViolation):
+                connection.execute(
+                    """
+                    INSERT INTO tasks (
+                        task_type,
+                        status,
+                        leased_by_worker_id,
+                        lease_token,
+                        lease_expires_at
+                    )
+                    VALUES ('invalid-lease', 'QUEUED', %s, %s, now() + interval '1 minute')
+                    """,
+                    (worker_id, uuid.uuid4()),
+                )
+
+            with pytest.raises(errors.CheckViolation):
+                connection.execute(
+                    """
+                    INSERT INTO tasks (task_type, status)
+                    VALUES ('invalid-terminal', 'SUCCEEDED')
+                    """,
+                )
+
+            lease_token = uuid.uuid4()
+            connection.execute(
+                """
+                INSERT INTO task_attempts (
+                    task_id,
+                    worker_id,
+                    attempt_number,
+                    status,
+                    lease_token,
+                    lease_expires_at
+                )
+                VALUES (%s, %s, 1, 'LEASED', %s, now() + interval '1 minute')
+                """,
+                (task_id, worker_id, lease_token),
+            )
+
+            with pytest.raises(errors.UniqueViolation):
+                connection.execute(
+                    """
+                    INSERT INTO task_attempts (
+                        task_id,
+                        worker_id,
+                        attempt_number,
+                        status,
+                        lease_token,
+                        lease_expires_at
+                    )
+                    VALUES (%s, %s, 1, 'LEASED', %s, now() + interval '1 minute')
+                    """,
+                    (task_id, worker_id, uuid.uuid4()),
+                )
+
+            with pytest.raises(errors.CheckViolation):
+                connection.execute(
+                    """
+                    INSERT INTO task_attempts (
+                        task_id,
+                        worker_id,
+                        attempt_number,
+                        status,
+                        lease_token,
+                        lease_expires_at
+                    )
+                    VALUES (%s, %s, 2, 'QUEUED', %s, now() + interval '1 minute')
+                    """,
+                    (task_id, worker_id, uuid.uuid4()),
+                )
+
+            with pytest.raises(errors.ForeignKeyViolation):
+                connection.execute(
+                    """
+                    INSERT INTO task_attempts (
+                        task_id,
+                        worker_id,
+                        attempt_number,
+                        status,
+                        lease_token,
+                        lease_expires_at
+                    )
+                    VALUES (%s, %s, 2, 'LEASED', %s, now() + interval '1 minute')
+                    """,
+                    (task_id, uuid.uuid4(), uuid.uuid4()),
+                )
+            connection.execute(DOWN_SQL)
+
+            assert fetch_scalar(connection, "SELECT to_regclass('tasks')") is None
+            assert fetch_scalar(connection, "SELECT to_regclass('workers')") is None
+            assert fetch_scalar(connection, "SELECT to_regclass('task_attempts')") is None
+            assert fetch_scalar(connection, "SELECT to_regtype('task_status')") is None
+            assert fetch_scalar(connection, "SELECT to_regprocedure('set_updated_at()')") is None
+        finally:
+            connection.execute(DOWN_SQL)
+            connection.execute("SET search_path TO public")
+            connection.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )

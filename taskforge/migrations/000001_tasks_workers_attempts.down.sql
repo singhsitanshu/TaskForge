@@ -1,0 +1,10 @@
+BEGIN;
+
+DROP TABLE IF EXISTS task_attempts;
+DROP TABLE IF EXISTS tasks;
+DROP TABLE IF EXISTS workers;
+DROP FUNCTION IF EXISTS set_updated_at();
+DROP TYPE IF EXISTS task_status;
+
+COMMIT;
+

@@ -27,7 +27,8 @@ Open the web app at <http://localhost:3000> and the API documentation at <http:/
     make format        # Apply formatters
     make format-check  # Verify formatting without modifying files
     make test          # Run service tests and build the frontend
+    make migrate-up    # Apply the PostgreSQL schema
+    make migrate-down  # Roll back the PostgreSQL schema
     make down          # Stop the local stack
 
 See [docs/architecture.md](docs/architecture.md) for service boundaries and communication paths.
-

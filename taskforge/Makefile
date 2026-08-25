@@ -1,4 +1,4 @@
-.PHONY: build up down logs health lint format format-check test
+.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-migrations
 
 build:
 	docker compose build
@@ -41,3 +41,15 @@ test:
 	cd scheduler && go test ./...
 	cd worker && go test ./...
 	cd web && npm run build
+	$(MAKE) test-migrations
+
+migrate-up:
+	docker compose up -d postgres
+	docker compose exec -T postgres psql --set ON_ERROR_STOP=1 --username "$${POSTGRES_USER:-taskforge}" --dbname "$${POSTGRES_DB:-taskforge}" < migrations/000001_tasks_workers_attempts.up.sql
+
+migrate-down:
+	docker compose up -d postgres
+	docker compose exec -T postgres psql --set ON_ERROR_STOP=1 --username "$${POSTGRES_USER:-taskforge}" --dbname "$${POSTGRES_DB:-taskforge}" < migrations/000001_tasks_workers_attempts.down.sql
+
+test-migrations:
+	docker compose --profile test run --rm --build migration-tests
