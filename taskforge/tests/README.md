@@ -1,16 +1,18 @@
 # Integration tests
 
-`test_migrations.py` verifies the PostgreSQL schema against a real server. It covers:
+The Docker-backed suite uses a real PostgreSQL server and temporary schemas:
 
-- all task status enum labels;
-- creation of `tasks`, `workers`, and `task_attempts`;
-- required operational indexes;
-- lease, terminal-state, foreign-key, idempotency, attempt-status, and uniqueness constraints;
-- complete migration rollback.
+- `test_migrations.py` verifies schema creation, constraints, indexes, and rollback.
+- `test_task_api.py` exercises task submission, retrieval, listing, cancellation, validation, conflicts, idempotency, and persisted `QUEUED` state through the FastAPI application.
 
-Run it through Docker Compose:
+Run all integration tests:
 
+    make test-integration
+
+Run one integration area:
+
+    make test-api
     make test-migrations
 
-The test operates inside a temporary schema and does not alter development tables.
+Temporary schemas are removed after each test module, leaving development tables untouched.
 

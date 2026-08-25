@@ -1,0 +1,172 @@
+from collections.abc import Sequence
+from typing import Any, Protocol
+from uuid import UUID
+
+from psycopg import errors
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
+
+from app.domain import NewTask, Task, TaskStatus
+
+_TASK_COLUMNS = """
+    id,
+    queue,
+    task_type,
+    payload,
+    status,
+    priority,
+    max_attempts,
+    attempt_count,
+    scheduled_at,
+    leased_by_worker_id,
+    lease_expires_at,
+    completed_at,
+    result,
+    last_error,
+    idempotency_key,
+    created_at,
+    updated_at
+"""
+
+
+class DuplicateTaskError(Exception):
+    pass
+
+
+class TaskRepository(Protocol):
+    async def create(self, new_task: NewTask) -> Task: ...
+
+    async def get(self, task_id: UUID) -> Task | None: ...
+
+    async def list(
+        self,
+        *,
+        status: TaskStatus | None,
+        queue: str | None,
+        limit: int,
+        offset: int,
+    ) -> Sequence[Task]: ...
+
+    async def cancel_active(self, task_id: UUID) -> Task | None: ...
+
+
+class PostgresTaskRepository:
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def create(self, new_task: NewTask) -> Task:
+        query = f"""
+            INSERT INTO tasks (
+                queue,
+                task_type,
+                payload,
+                status,
+                priority,
+                max_attempts,
+                scheduled_at,
+                idempotency_key
+            )
+            VALUES (%s, %s, %s, 'QUEUED', %s, %s, COALESCE(%s, now()), %s)
+            RETURNING {_TASK_COLUMNS}
+        """
+        parameters = (
+            new_task.queue,
+            new_task.task_type,
+            Jsonb(new_task.payload),
+            new_task.priority,
+            new_task.max_attempts,
+            new_task.scheduled_at,
+            new_task.idempotency_key,
+        )
+
+        try:
+            async with self._pool.connection() as connection:
+                cursor = await connection.execute(query, parameters)
+                row = await cursor.fetchone()
+        except errors.UniqueViolation as exc:
+            if exc.diag.constraint_name == "tasks_queue_idempotency_key_idx":
+                raise DuplicateTaskError from exc
+            raise
+
+        assert row is not None
+        return _task_from_row(row)
+
+    async def get(self, task_id: UUID) -> Task | None:
+        query = f"SELECT {_TASK_COLUMNS} FROM tasks WHERE id = %s"
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(query, (task_id,))
+            row = await cursor.fetchone()
+        return _task_from_row(row) if row else None
+
+    async def list(
+        self,
+        *,
+        status: TaskStatus | None,
+        queue: str | None,
+        limit: int,
+        offset: int,
+    ) -> Sequence[Task]:
+        conditions: list[str] = []
+        parameters: list[object] = []
+
+        if status is not None:
+            conditions.append("status = %s")
+            parameters.append(status.value)
+        if queue is not None:
+            conditions.append("queue = %s")
+            parameters.append(queue)
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            SELECT {_TASK_COLUMNS}
+            FROM tasks
+            {where_clause}
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s OFFSET %s
+        """
+        parameters.extend((limit, offset))
+
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(query, parameters)
+            rows = await cursor.fetchall()
+        return [_task_from_row(row) for row in rows]
+
+    async def cancel_active(self, task_id: UUID) -> Task | None:
+        query = f"""
+            UPDATE tasks
+            SET
+                status = 'CANCELLED',
+                completed_at = clock_timestamp(),
+                leased_by_worker_id = NULL,
+                lease_token = NULL,
+                lease_expires_at = NULL
+            WHERE id = %s
+              AND status IN ('QUEUED', 'LEASED', 'RUNNING', 'RETRYING')
+            RETURNING {_TASK_COLUMNS}
+        """
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(query, (task_id,))
+            row = await cursor.fetchone()
+        return _task_from_row(row) if row else None
+
+
+def _task_from_row(row: dict[str, Any]) -> Task:
+    return Task(
+        id=row["id"],
+        queue=row["queue"],
+        task_type=row["task_type"],
+        payload=row["payload"],
+        status=TaskStatus(row["status"]),
+        priority=row["priority"],
+        max_attempts=row["max_attempts"],
+        attempt_count=row["attempt_count"],
+        scheduled_at=row["scheduled_at"],
+        leased_by_worker_id=row["leased_by_worker_id"],
+        lease_expires_at=row["lease_expires_at"],
+        completed_at=row["completed_at"],
+        result=row["result"],
+        last_error=row["last_error"],
+        idempotency_key=row["idempotency_key"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )

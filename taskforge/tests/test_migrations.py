@@ -36,13 +36,9 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
     schema_name = f"migration_test_{uuid.uuid4().hex}"
 
     with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
-        connection.execute(
-            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
-        )
+        connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
         try:
-            connection.execute(
-                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
-            )
+            connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name)))
             connection.execute(UP_SQL)
 
             tables = {
@@ -219,7 +215,5 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
             connection.execute(DOWN_SQL)
             connection.execute("SET search_path TO public")
             connection.execute(
-                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
-                    sql.Identifier(schema_name)
-                )
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema_name))
             )
