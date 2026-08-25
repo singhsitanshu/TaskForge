@@ -2,7 +2,7 @@
 
 ## Scope
 
-This milestone establishes deployable service boundaries and local infrastructure. It does **not** implement task creation, schedule evaluation, queue publishing, queue consumption, or task execution. The PostgreSQL and Redis connections documented below describe the intended paths for later milestones.
+This milestone implements task creation and the first worker execution path. The worker supports only predefined test handlers and polls PostgreSQL directly. Schedule evaluation, retries, leases, priorities, Redis dispatch, heartbeats, and arbitrary task execution remain out of scope.
 
 ## Service boundaries
 
@@ -12,9 +12,9 @@ The React/TypeScript application is the browser-facing interface. It is built as
 
 ### API (`api`)
 
-The FastAPI service is the public application boundary. It will own request validation, authentication and authorization, and task lifecycle mutations. PostgreSQL is the source of truth for durable state. When dispatch is implemented, the API may publish immediate work to Redis, but clients should never depend on Redis directly.
+The FastAPI service is the public application boundary. It owns request validation and task lifecycle mutations. PostgreSQL is the source of truth for durable state. Clients never depend on PostgreSQL or Redis directly.
 
-The current API exposes only `/healthz` and FastAPI's generated documentation.
+The current API exposes `/healthz`, task submission, retrieval, listing, and cancellation, plus FastAPI's generated documentation.
 
 ### Scheduler (`scheduler`)
 
@@ -24,17 +24,17 @@ The current scheduler starts an operational HTTP server with only `/healthz`; it
 
 ### Worker (`worker`)
 
-The Go worker will consume task identifiers from Redis, load authoritative task data, execute supported task types, and persist results. It must not accept public task submissions or decide when scheduled work becomes due.
+The Go worker registers itself in PostgreSQL, polls for eligible `QUEUED` tasks, atomically claims one task, records an attempt, executes a registered handler, and persists success or failure before polling again. Concurrent workers use `FOR UPDATE SKIP LOCKED` so only one claims a task.
 
-The current worker starts an operational HTTP server with only `/healthz`; it does not consume messages or execute tasks.
+The registry currently contains only `test.echo` and `test.fail`. Unknown task types fail safely; the worker never executes task-provided code or commands. This first version intentionally has no retry, lease, priority, Redis, or heartbeat behavior.
 
 ### PostgreSQL (`postgres`)
 
-PostgreSQL is the durable system of record for task definitions, schedules, lifecycle state, attempts, and results. Schema changes belong in `migrations/`. No application schema is introduced in this milestone.
+PostgreSQL is the durable system of record for task definitions, lifecycle state, attempts, worker registrations, and results. Schema changes belong in `migrations/`.
 
 ### Redis (`redis`)
 
-Redis is reserved for transient coordination: dispatch queues, delivery metadata, and short-lived locks. It is not the source of truth. Queue messages should eventually contain stable identifiers rather than full authoritative task records so consumers can reconcile with PostgreSQL.
+Redis is reserved for future transient coordination. It is not used by the API-to-worker execution path and remains independent of worker startup.
 
 ## Communication paths
 
@@ -44,20 +44,16 @@ Redis is reserved for transient coordination: dispatch queues, delivery metadata
        v
     Web (static UI) -------- HTTP/JSON --------> API
                                                    |
-                                                   | durable reads/writes (future)
+                                                   | durable reads/writes
                                                    v
                                               PostgreSQL
-                                                   ^
-                                                   |
-    Scheduler -------- schedule queries (future) --+
-       |
-       | enqueue task ID (future)
-       v
-     Redis queue -------- dequeue task ID (future) --------> Worker
-                                                              |
-                                                              | lifecycle/result writes (future)
-                                                              v
-                                                         PostgreSQL
+                                                ^   ^
+                          poll/claim/attempts ---+   +--- schedule queries (future)
+                          and result writes      |        Scheduler
+                                                |
+                                             Worker
+
+    Redis is present for future coordination but is not on this path.
 
 All service-to-service traffic uses Docker Compose's internal DNS names (`api`, `postgres`, and `redis`). Only browser-facing development ports and health endpoints are published to the host.
 
@@ -69,19 +65,19 @@ Each container has a health check:
 - Redis uses `redis-cli ping`.
 - API, scheduler, worker, and web expose `/healthz`.
 
-Compose waits for PostgreSQL and Redis before starting backend service shells, and waits for the API before starting the web container. The HTTP health endpoints are liveness checks; they deliberately do not claim that unimplemented task functionality is ready.
+Compose waits for PostgreSQL before starting the API and worker, and waits for the API before starting the web container. The worker registers before starting its polling loop. HTTP health endpoints remain liveness checks.
 
 ## Ownership rules
 
 - Public contracts live in the API and are documented in `docs/api.md`.
 - Database evolution is append-only through `migrations/`; services must not create ad hoc schemas at startup.
-- Redis payloads are internal versioned contracts between producers and workers.
+- The worker handler registry is the sole allowlist for executable task types.
 - Scheduler and worker operational endpoints are not product APIs.
 - Cross-service shared source packages should be avoided. Share explicit wire contracts instead, allowing Python, Go, and TypeScript services to evolve independently.
 
 ## Observability
 
-Services currently log to standard output for collection by the container runtime. Future metrics, dashboards, and alerting configuration belong in `monitoring/`. Correlation IDs and task IDs should be carried across API requests, queue messages, scheduler logs, and worker logs once those paths exist.
+Services currently log to standard output for collection by the container runtime. Future metrics, dashboards, and alerting configuration belong in `monitoring/`. Task IDs are included in worker execution logs; broader correlation IDs can be added when more communication paths exist.
 
 ## Repository layout
 
@@ -94,4 +90,3 @@ Services currently log to standard output for collection by the container runtim
     tests/        Cross-service and integration tests
     scripts/      Developer and operational scripts
     docs/         Architecture and contract documentation
-

@@ -1,4 +1,4 @@
-.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-api test-migrations
+.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-api test-migrations test-worker
 
 build:
 	docker compose build
@@ -45,11 +45,15 @@ test:
 
 migrate-up:
 	docker compose up -d postgres
-	docker compose exec -T postgres psql --set ON_ERROR_STOP=1 --username "$${POSTGRES_USER:-taskforge}" --dbname "$${POSTGRES_DB:-taskforge}" < migrations/000001_tasks_workers_attempts.up.sql
+	@for file in migrations/*.up.sql; do \
+		docker compose exec -T postgres psql --set ON_ERROR_STOP=1 --username "$${POSTGRES_USER:-taskforge}" --dbname "$${POSTGRES_DB:-taskforge}" < "$$file"; \
+	done
 
 migrate-down:
 	docker compose up -d postgres
-	docker compose exec -T postgres psql --set ON_ERROR_STOP=1 --username "$${POSTGRES_USER:-taskforge}" --dbname "$${POSTGRES_DB:-taskforge}" < migrations/000001_tasks_workers_attempts.down.sql
+	@find migrations -name '*.down.sql' -print | sort -r | while read -r file; do \
+		docker compose exec -T postgres psql --set ON_ERROR_STOP=1 --username "$${POSTGRES_USER:-taskforge}" --dbname "$${POSTGRES_DB:-taskforge}" < "$$file"; \
+	done
 
 test-integration:
 	docker compose --profile test run --rm --build integration-tests
@@ -59,3 +63,6 @@ test-api:
 
 test-migrations:
 	docker compose --profile test run --rm --build integration-tests pytest -q tests/test_migrations.py
+
+test-worker:
+	docker compose --profile test run --rm --build integration-tests pytest -q tests/test_worker_e2e.py

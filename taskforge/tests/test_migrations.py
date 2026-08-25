@@ -7,8 +7,11 @@ import pytest
 from psycopg import errors, sql
 
 ROOT = Path(__file__).resolve().parents[1]
-UP_SQL = (ROOT / "migrations" / "000001_tasks_workers_attempts.up.sql").read_text()
-DOWN_SQL = (ROOT / "migrations" / "000001_tasks_workers_attempts.down.sql").read_text()
+MIGRATIONS = ROOT / "migrations"
+UP_SQL = "\n".join(path.read_text() for path in sorted(MIGRATIONS.glob("*.up.sql")))
+DOWN_SQL = "\n".join(
+    path.read_text() for path in sorted(MIGRATIONS.glob("*.down.sql"), reverse=True)
+)
 DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
 pytestmark = pytest.mark.skipif(
@@ -85,6 +88,7 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 "tasks_expired_lease_idx",
                 "tasks_status_updated_idx",
                 "tasks_lease_token_unique",
+                "tasks_claimed_worker_idx",
                 "workers_available_idx",
                 "task_attempts_worker_active_idx",
                 "task_attempts_finished_idx",
@@ -212,7 +216,10 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
             assert fetch_scalar(connection, "SELECT to_regtype('task_status')") is None
             assert fetch_scalar(connection, "SELECT to_regprocedure('set_updated_at()')") is None
         finally:
-            connection.execute(DOWN_SQL)
+            # The happy path already exercises the complete rollback. On failure,
+            # discard any open migration transaction and let the temporary schema
+            # provide deterministic cleanup.
+            connection.rollback()
             connection.execute("SET search_path TO public")
             connection.execute(
                 sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema_name))

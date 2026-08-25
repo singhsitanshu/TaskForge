@@ -139,7 +139,8 @@ class PostgresTaskRepository:
                 completed_at = clock_timestamp(),
                 leased_by_worker_id = NULL,
                 lease_token = NULL,
-                lease_expires_at = NULL
+                lease_expires_at = NULL,
+                claimed_by_worker_id = NULL
             WHERE id = %s
               AND status IN ('QUEUED', 'LEASED', 'RUNNING', 'RETRYING')
             RETURNING {_TASK_COLUMNS}

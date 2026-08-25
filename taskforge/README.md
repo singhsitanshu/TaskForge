@@ -1,14 +1,14 @@
 # TaskForge
 
-TaskForge is a service-oriented task orchestration platform. This repository currently contains the service shells, local infrastructure, and developer tooling only; task scheduling and execution are intentionally not implemented yet.
+TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission and a deliberately small PostgreSQL-polling worker for predefined test handlers. Scheduling, retries, leases, priorities, Redis dispatch, and arbitrary task execution are not implemented.
 
 ## Services
 
 | Service | Technology | Local port | Responsibility |
 | --- | --- | ---: | --- |
-| `api` | Python / FastAPI | 8000 | Public HTTP API and future task lifecycle ownership |
+| `api` | Python / FastAPI | 8000 | Public task API and task lifecycle ownership |
 | `scheduler` | Go | 8081 | Future schedule evaluation and dispatch coordination |
-| `worker` | Go | 8082 | Future task execution; currently health checks only |
+| `worker` | Go | 8082 | Polls PostgreSQL and executes registered test handlers |
 | `web` | React / TypeScript | 3000 | Browser interface |
 | `postgres` | PostgreSQL | 5432 | Durable application state |
 | `redis` | Redis | 6379 | Future queueing and short-lived coordination |
@@ -16,6 +16,7 @@ TaskForge is a service-oriented task orchestration platform. This repository cur
 ## Quick start
 
     cp .env.example .env
+    make migrate-up
     make up
     make health
 
@@ -27,6 +28,7 @@ Open the web app at <http://localhost:3000> and the API documentation at <http:/
     make format        # Apply formatters
     make format-check  # Verify formatting without modifying files
     make test          # Run service tests and build the frontend
+    make test-worker   # Run the PostgreSQL-backed worker end-to-end test
     make migrate-up    # Apply the PostgreSQL schema
     make migrate-down  # Roll back the PostgreSQL schema
     make down          # Stop the local stack

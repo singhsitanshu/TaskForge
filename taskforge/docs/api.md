@@ -13,8 +13,8 @@ Request fields:
 | `task_type` | yes | Non-empty task type, at most 255 characters. |
 | `payload` | no | JSON object; defaults to an empty object. |
 | `queue` | no | Queue name; defaults to `default`. |
-| `priority` | no | Signed 16-bit priority; higher values dispatch first. |
-| `max_attempts` | no | Between 1 and 100; defaults to 3. |
+| `priority` | no | Signed 16-bit value; persisted but ignored by the first worker. |
+| `max_attempts` | no | Between 1 and 100; persisted, but retries are not implemented. |
 | `scheduled_at` | no | ISO 8601 timestamp; defaults to database time. |
 | `idempotency_key` | no | Unique within a queue. Duplicate submissions return `409`. |
 
@@ -35,9 +35,8 @@ Results are ordered by newest creation time, then ID.
 
 ## Cancel a task
 
-`POST /tasks/{id}/cancel` atomically transitions `QUEUED`, `LEASED`, `RUNNING`, or `RETRYING` to `CANCELLED`, sets `completed_at`, and clears lease ownership.
+`POST /tasks/{id}/cancel` atomically transitions `QUEUED`, `LEASED`, `RUNNING`, or `RETRYING` to `CANCELLED`, sets `completed_at`, and clears worker ownership metadata.
 
 Cancellation is idempotent for an already `CANCELLED` task. Unknown tasks return `404`; `SUCCEEDED` or `FAILED` tasks return `409`.
 
 This endpoint changes lifecycle state only. It does not execute tasks or implement worker behavior.
-

@@ -10,8 +10,11 @@ from fastapi.testclient import TestClient
 from psycopg import sql
 
 ROOT = Path(__file__).resolve().parents[1]
-UP_SQL = (ROOT / "migrations" / "000001_tasks_workers_attempts.up.sql").read_text()
-DOWN_SQL = (ROOT / "migrations" / "000001_tasks_workers_attempts.down.sql").read_text()
+MIGRATIONS = ROOT / "migrations"
+UP_SQL = "\n".join(path.read_text() for path in sorted(MIGRATIONS.glob("*.up.sql")))
+DOWN_SQL = "\n".join(
+    path.read_text() for path in sorted(MIGRATIONS.glob("*.down.sql"), reverse=True)
+)
 
 
 @pytest.fixture(scope="module")
