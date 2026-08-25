@@ -7,6 +7,14 @@ COPY worker/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/taskforge-worker .
 RUN CGO_ENABLED=0 GOOS=linux go build -tags tf005test -trimpath -ldflags="-s -w" -o /out/taskforge-claim-harness ./cmd/claim-harness
 
+FROM golang:1.23-alpine AS scheduler-build
+
+WORKDIR /src
+COPY scheduler/go.mod scheduler/go.sum ./
+RUN go mod download
+COPY scheduler/ .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/taskforge-scheduler .
+
 FROM python:3.13-slim
 
 WORKDIR /workspace
@@ -20,6 +28,7 @@ RUN pip install --no-cache-dir \
 COPY api/app ./api/app
 COPY --from=worker-build /out/taskforge-worker /usr/local/bin/taskforge-worker
 COPY --from=worker-build /out/taskforge-claim-harness /usr/local/bin/taskforge-claim-harness
+COPY --from=scheduler-build /out/taskforge-scheduler /usr/local/bin/taskforge-scheduler
 COPY migrations ./migrations
 COPY tests/test_migrations.py ./tests/test_migrations.py
 COPY tests/test_task_api.py ./tests/test_task_api.py
@@ -27,7 +36,8 @@ COPY tests/test_worker_e2e.py ./tests/test_worker_e2e.py
 COPY tests/test_claim_races.py ./tests/test_claim_races.py
 COPY tests/test_worker_api.py ./tests/test_worker_api.py
 COPY tests/test_worker_heartbeat.py ./tests/test_worker_heartbeat.py
+COPY tests/test_recovery_e2e.py ./tests/test_recovery_e2e.py
 
 ENV PYTHONPATH=/workspace/api
 
-CMD ["pytest", "-q", "tests/test_migrations.py", "tests/test_task_api.py", "tests/test_worker_e2e.py", "tests/test_claim_races.py", "tests/test_worker_api.py", "tests/test_worker_heartbeat.py"]
+CMD ["pytest", "-q", "tests/test_migrations.py", "tests/test_task_api.py", "tests/test_worker_e2e.py", "tests/test_claim_races.py", "tests/test_worker_api.py", "tests/test_worker_heartbeat.py", "tests/test_recovery_e2e.py"]

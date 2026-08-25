@@ -157,6 +157,121 @@ func TestExpiredLeaseAndStaleAttemptCannotComplete(t *testing.T) {
 	}
 }
 
+func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
+	database := newTestDatabase(t)
+	workers := registerWorkers(t, database, 2)
+	ctx := context.Background()
+	insertTask(t, database, 0, time.Time{}, "")
+	oldClaim, err := database.store.ClaimNext(ctx, workers[0].ID, time.Second)
+	if err != nil || oldClaim == nil {
+		t.Fatalf("claim old attempt: task=%v error=%v", oldClaim, err)
+	}
+
+	tx, err := database.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin recovery fixture: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE task_attempts
+		SET status = 'ABANDONED', finished_at = clock_timestamp(), error = 'lease_expired'
+		WHERE id = $1::uuid AND status = 'RUNNING'
+	`, oldClaim.AttemptID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("abandon old attempt: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE tasks
+		SET
+			status = 'QUEUED',
+			claimed_by_worker_id = NULL,
+			lease_expires_at = NULL,
+			last_error = 'lease_expired'
+		WHERE id = $1::uuid
+	`, oldClaim.ID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("requeue recovered task: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit recovery fixture: %v", err)
+	}
+
+	if _, err := database.store.RenewLease(
+		ctx,
+		oldClaim.ID,
+		workers[0].ID,
+		oldClaim.AttemptNumber,
+		time.Second,
+	); !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("old worker renewed recovered task: %v", err)
+	}
+	if err := database.store.Complete(
+		ctx,
+		workers[0].ID,
+		oldClaim,
+		map[string]any{"stale": true},
+		nil,
+	); !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("old worker completed recovered task: %v", err)
+	}
+	if err := database.store.Complete(
+		ctx,
+		workers[0].ID,
+		oldClaim,
+		nil,
+		errors.New("stale handler failure"),
+	); !errors.Is(err, domain.ErrLeaseLost) {
+		t.Fatalf("old worker failed recovered task: %v", err)
+	}
+
+	newClaim, err := database.store.ClaimNext(ctx, workers[1].ID, time.Second)
+	if err != nil || newClaim == nil {
+		t.Fatalf("claim recovered task: task=%v error=%v", newClaim, err)
+	}
+	if newClaim.ID != oldClaim.ID || newClaim.AttemptNumber != 2 {
+		t.Fatalf("unexpected reclaim: old=%+v new=%+v", oldClaim, newClaim)
+	}
+	if err := database.store.Complete(
+		ctx,
+		workers[1].ID,
+		newClaim,
+		map[string]any{"recovered": true},
+		nil,
+	); err != nil {
+		t.Fatalf("complete recovered task: %v", err)
+	}
+
+	rows, err := database.pool.Query(ctx, `
+		SELECT attempt_number, worker_id::text, status::text, error
+		FROM task_attempts
+		WHERE task_id = $1::uuid
+		ORDER BY attempt_number
+	`, oldClaim.ID)
+	if err != nil {
+		t.Fatalf("read recovered history: %v", err)
+	}
+	defer rows.Close()
+	type attemptState struct {
+		number   int
+		workerID string
+		status   string
+		error    *string
+	}
+	attempts := make([]attemptState, 0, 2)
+	for rows.Next() {
+		var attempt attemptState
+		if err := rows.Scan(&attempt.number, &attempt.workerID, &attempt.status, &attempt.error); err != nil {
+			t.Fatalf("scan recovered history: %v", err)
+		}
+		attempts = append(attempts, attempt)
+	}
+	if len(attempts) != 2 ||
+		attempts[0].number != 1 || attempts[0].workerID != workers[0].ID || attempts[0].status != "ABANDONED" ||
+		attempts[1].number != 2 || attempts[1].workerID != workers[1].ID || attempts[1].status != "SUCCEEDED" {
+		t.Fatalf("unexpected recovered history: %+v", attempts)
+	}
+	t.Log("STALE_OWNER renew=rejected complete=rejected fail=rejected next_attempt=2 final=SUCCEEDED")
+}
+
 func TestFailedAndCancelledTasksCannotRenew(t *testing.T) {
 	database := newTestDatabase(t)
 	worker := registerWorkers(t, database, 1)[0]

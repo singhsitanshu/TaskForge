@@ -5,7 +5,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.domain import TaskStatus
 from app.repositories import DuplicateTaskError
-from app.schemas import TaskCreate, TaskListResponse, TaskResponse
+from app.schemas import (
+    TaskAttemptListResponse,
+    TaskAttemptResponse,
+    TaskCreate,
+    TaskListResponse,
+    TaskResponse,
+)
 from app.services import TaskConflictError, TaskNotFoundError, TaskService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -46,6 +52,23 @@ async def get_task(
             detail="task not found",
         ) from exc
     return TaskResponse.from_domain(task)
+
+
+@router.get("/{task_id}/attempts", response_model=TaskAttemptListResponse)
+async def list_task_attempts(
+    task_id: UUID,
+    service: TaskServiceDependency,
+) -> TaskAttemptListResponse:
+    try:
+        attempts = await service.list_attempts(task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="task not found",
+        ) from exc
+    return TaskAttemptListResponse(
+        items=[TaskAttemptResponse.from_domain(attempt) for attempt in attempts]
+    )
 
 
 @router.get("", response_model=TaskListResponse)

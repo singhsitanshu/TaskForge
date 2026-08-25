@@ -3,38 +3,109 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"taskforge/scheduler/internal/config"
+	"taskforge/scheduler/internal/repository"
+	"taskforge/scheduler/internal/service"
 )
 
 func main() {
-	addr := envOrDefault("HTTP_ADDR", ":8080")
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if err := run(logger); err != nil {
+		logger.Error("scheduler stopped", "event", "scheduler_failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger) error {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return errors.New("DATABASE_URL is required")
+	}
+	recoveryConfig, err := config.RecoveryFromEnv()
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return fmt.Errorf("create database pool: %w", err)
+	}
+	defer pool.Close()
+	connectContext, cancelConnect := context.WithTimeout(ctx, recoveryConfig.DBTimeout)
+	err = pool.Ping(connectContext)
+	cancelConnect()
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+
+	recovery := service.NewRecovery(
+		repository.NewPostgres(pool),
+		recoveryConfig,
+		logger,
+	)
 	server := &http.Server{
-		Addr:              addr,
+		Addr:              envOrDefault("HTTP_ADDR", ":8080"),
 		Handler:           newMux(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	shutdownSignal, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
+	serverErrors := make(chan error, 1)
 	go func() {
-		<-shutdownSignal.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("scheduler shutdown: %v", err)
+		logger.Info(
+			"scheduler health server listening",
+			"event", "scheduler_started",
+			"address", server.Addr,
+			"recovery_interval", recoveryConfig.Interval,
+			"recovery_batch_size", recoveryConfig.BatchSize,
+			"recovery_db_timeout", recoveryConfig.DBTimeout,
+		)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
 		}
 	}()
 
-	log.Printf("scheduler health server listening on %s", addr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+	var lifecycle sync.WaitGroup
+	lifecycle.Add(1)
+	go func() {
+		defer lifecycle.Done()
+		recovery.Run(ctx)
+	}()
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case runErr = <-serverErrors:
+		stop()
 	}
+	stop()
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := server.Shutdown(shutdownContext); err != nil && runErr == nil {
+		runErr = fmt.Errorf("shutdown health server: %w", err)
+	}
+	lifecycle.Wait()
+	logger.Info("scheduler shutdown complete", "event", "scheduler_shutdown")
+	return runErr
 }
 
 func newMux() http.Handler {

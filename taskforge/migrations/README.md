@@ -10,6 +10,8 @@ TaskForge uses paired, ordered PostgreSQL migration files:
 - `000003_pre_tf005_remediation.down.sql` removes those remediation objects.
 - `000004_task_leases.up.sql` canonicalizes task leases and adds the expired-running-task index.
 - `000004_task_leases.down.sql` restores the pre-TF-007 lease scaffolding.
+- `000005_expired_lease_recovery.up.sql` adds attempt-level `ABANDONED` semantics and protects task rows from using that status.
+- `000005_expired_lease_recovery.down.sql` converts abandoned history to failed history and restores pre-TF-008 constraints. PostgreSQL retains the additive enum label until the foundational migration drops the enum; constraints prevent its use after this partial rollback.
 
 Apply or roll back the current migration against the Compose PostgreSQL service:
 

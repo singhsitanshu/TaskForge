@@ -1,13 +1,13 @@
 # TaskForge
 
-TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission, priority-aware PostgreSQL workers, durable worker heartbeats, derived liveness, and renewable task ownership leases. Scheduling, retries, expired-task recovery, Redis dispatch, and arbitrary task execution are not implemented.
+TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission, priority-aware PostgreSQL workers, durable worker heartbeats, renewable task ownership leases, and scheduler-driven recovery of expired ownership. Ordinary handler retries, retry backoff, schedule evaluation, Redis dispatch, and arbitrary task execution are not implemented.
 
 ## Services
 
 | Service | Technology | Local port | Responsibility |
 | --- | --- | ---: | --- |
 | `api` | Python / FastAPI | 8000 | Task control plane and worker-liveness visibility |
-| `scheduler` | Go | 8081 | Future schedule evaluation and dispatch coordination |
+| `scheduler` | Go | internal | Recovers expired task leases transactionally; future schedule evaluation |
 | `worker` | Go | internal | Polls PostgreSQL, executes registered handlers, and heartbeats independently |
 | `web` | React / TypeScript | 3000 | Browser interface |
 | `postgres` | PostgreSQL | 5432 | Durable application state |
@@ -30,6 +30,7 @@ Open the web app at <http://localhost:3000> and the API documentation at <http:/
     make test          # Run service tests and build the frontend
     make test-worker   # Run the PostgreSQL-backed worker end-to-end test
     make test-heartbeats # Run worker-liveness integration tests
+    make test-recovery  # Run scheduler recovery tests with Go race detection
     make migrate-up    # Apply the PostgreSQL schema
     make migrate-down  # Roll back the PostgreSQL schema
     make down          # Stop the local stack

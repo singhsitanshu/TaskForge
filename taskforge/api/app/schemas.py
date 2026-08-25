@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from app.domain import NewTask, Task, TaskStatus, Worker
+from app.domain import NewTask, Task, TaskAttempt, TaskAttemptStatus, TaskStatus, Worker
 from app.liveness import WorkerLiveness
 
 QueueName = Annotated[
@@ -74,6 +74,31 @@ class TaskListResponse(BaseModel):
     items: list[TaskResponse]
     limit: int
     offset: int
+
+
+class TaskAttemptResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    task_id: UUID
+    worker_id: UUID
+    attempt_number: int
+    status: TaskAttemptStatus
+    leased_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    output: dict[str, Any] | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_domain(cls, attempt: TaskAttempt) -> "TaskAttemptResponse":
+        return cls.model_validate(attempt)
+
+
+class TaskAttemptListResponse(BaseModel):
+    items: list[TaskAttemptResponse]
 
 
 class WorkerResponse(BaseModel):

@@ -17,6 +17,15 @@ class TaskStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class TaskAttemptStatus(StrEnum):
+    LEASED = "LEASED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    ABANDONED = "ABANDONED"
+
+
 @dataclass(frozen=True, slots=True)
 class Task:
     id: UUID
@@ -47,6 +56,22 @@ class NewTask:
     max_attempts: int
     scheduled_at: datetime | None
     idempotency_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskAttempt:
+    id: UUID
+    task_id: UUID
+    worker_id: UUID
+    attempt_number: int
+    status: TaskAttemptStatus
+    leased_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    output: dict[str, Any] | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

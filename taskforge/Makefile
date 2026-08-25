@@ -1,4 +1,4 @@
-.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-claims test-api test-migrations test-worker test-heartbeats test-leases
+.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-api test-migrations test-worker test-heartbeats test-leases
 
 build:
 	docker compose build
@@ -14,7 +14,7 @@ logs:
 
 health:
 	@curl --fail --silent http://localhost:$${API_PORT:-8000}/healthz
-	@curl --fail --silent http://localhost:$${SCHEDULER_PORT:-8081}/healthz
+	@docker compose exec -T scheduler wget --quiet --tries=1 --spider http://127.0.0.1:8080/healthz
 	@docker compose exec -T worker wget --quiet --tries=1 --spider http://127.0.0.1:8080/healthz
 	@curl --fail --silent http://localhost:$${WEB_PORT:-3000}/healthz
 	@printf '\nAll HTTP services are healthy.\n'
@@ -43,6 +43,7 @@ test:
 	cd web && npm run build
 	$(MAKE) test-integration
 	$(MAKE) test-claims
+	$(MAKE) test-recovery
 
 migrate-up:
 	@./scripts/migrate.sh up
@@ -55,6 +56,9 @@ test-integration:
 
 test-claims:
 	docker compose --profile test run --rm --build claim-tests
+
+test-recovery:
+	docker compose --profile test run --rm --build recovery-tests
 
 test-api:
 	docker compose --profile test run --rm --build integration-tests pytest -q tests/test_task_api.py

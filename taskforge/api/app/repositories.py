@@ -6,7 +6,14 @@ from psycopg import errors
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from app.domain import NewTask, Task, TaskStatus, WorkerRecord
+from app.domain import (
+    NewTask,
+    Task,
+    TaskAttempt,
+    TaskAttemptStatus,
+    TaskStatus,
+    WorkerRecord,
+)
 
 _TASK_COLUMNS = """
     id,
@@ -24,6 +31,21 @@ _TASK_COLUMNS = """
     result,
     last_error,
     idempotency_key,
+    created_at,
+    updated_at
+"""
+
+_TASK_ATTEMPT_COLUMNS = """
+    id,
+    task_id,
+    worker_id,
+    attempt_number,
+    status,
+    leased_at,
+    started_at,
+    finished_at,
+    output,
+    error,
     created_at,
     updated_at
 """
@@ -48,6 +70,8 @@ class TaskRepository(Protocol):
     ) -> Sequence[Task]: ...
 
     async def cancel_active(self, task_id: UUID) -> Task | None: ...
+
+    async def list_attempts(self, task_id: UUID) -> Sequence[TaskAttempt]: ...
 
 
 class WorkerRepository(Protocol):
@@ -152,6 +176,18 @@ class PostgresTaskRepository:
             row = await cursor.fetchone()
         return _task_from_row(row) if row else None
 
+    async def list_attempts(self, task_id: UUID) -> Sequence[TaskAttempt]:
+        query = f"""
+            SELECT {_TASK_ATTEMPT_COLUMNS}
+            FROM task_attempts
+            WHERE task_id = %s
+            ORDER BY attempt_number ASC
+        """
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(query, (task_id,))
+            rows = await cursor.fetchall()
+        return [_task_attempt_from_row(row) for row in rows]
+
 
 def _task_from_row(row: dict[str, Any]) -> Task:
     return Task(
@@ -170,6 +206,23 @@ def _task_from_row(row: dict[str, Any]) -> Task:
         result=row["result"],
         last_error=row["last_error"],
         idempotency_key=row["idempotency_key"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _task_attempt_from_row(row: dict[str, Any]) -> TaskAttempt:
+    return TaskAttempt(
+        id=row["id"],
+        task_id=row["task_id"],
+        worker_id=row["worker_id"],
+        attempt_number=row["attempt_number"],
+        status=TaskAttemptStatus(row["status"]),
+        leased_at=row["leased_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        output=row["output"],
+        error=row["error"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

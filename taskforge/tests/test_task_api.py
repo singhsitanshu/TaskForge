@@ -240,7 +240,70 @@ def test_cancel_running_task_returns_conflict_and_preserves_attempt(
 def test_unknown_tasks_return_not_found(api_client: TestClient) -> None:
     task_id = uuid.uuid4()
     assert api_client.get(f"/tasks/{task_id}").status_code == 404
+    assert api_client.get(f"/tasks/{task_id}/attempts").status_code == 404
     assert api_client.post(f"/tasks/{task_id}/cancel").status_code == 404
+
+
+def test_attempt_history_is_ordered_and_exposes_abandonment(
+    api_client: TestClient,
+    database_schema: str,
+) -> None:
+    submitted = api_client.post(
+        "/tasks",
+        json={"task_type": "history.demo", "max_attempts": 3},
+    ).json()
+    with database_connection(database_schema) as connection:
+        worker_a = connection.execute(
+            """
+            INSERT INTO workers (instance_id, name)
+            VALUES (%s, 'history worker A')
+            RETURNING id
+            """,
+            (f"history-a-{uuid.uuid4().hex}",),
+        ).fetchone()[0]
+        worker_b = connection.execute(
+            """
+            INSERT INTO workers (instance_id, name)
+            VALUES (%s, 'history worker B')
+            RETURNING id
+            """,
+            (f"history-b-{uuid.uuid4().hex}",),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            UPDATE tasks
+            SET
+                status = 'SUCCEEDED',
+                attempt_count = 2,
+                completed_at = clock_timestamp(),
+                result = '{"ok": true}'::jsonb
+            WHERE id = %s
+            """,
+            (submitted["id"],),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_attempts (
+                task_id, worker_id, attempt_number, status,
+                started_at, finished_at, error
+            )
+            VALUES
+                (%s, %s, 2, 'SUCCEEDED', clock_timestamp(), clock_timestamp(), NULL),
+                (%s, %s, 1, 'ABANDONED', clock_timestamp(), clock_timestamp(), 'lease_expired')
+            """,
+            (submitted["id"], worker_b, submitted["id"], worker_a),
+        )
+
+    response = api_client.get(f"/tasks/{submitted['id']}/attempts")
+    assert response.status_code == 200
+    attempts = response.json()["items"]
+    assert [attempt["attempt_number"] for attempt in attempts] == [1, 2]
+    assert [attempt["status"] for attempt in attempts] == ["ABANDONED", "SUCCEEDED"]
+    assert attempts[0]["worker_id"] == str(worker_a)
+    assert attempts[0]["error"] == "lease_expired"
+    assert attempts[0]["finished_at"] is not None
+    assert attempts[1]["worker_id"] == str(worker_b)
+    assert "lease_token" not in attempts[0]
 
 
 @pytest.mark.parametrize(

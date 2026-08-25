@@ -2,102 +2,110 @@
 
 ## Scope
 
-This milestone implements task creation, the first worker execution path, and worker-liveness visibility. The worker supports only predefined test handlers, polls PostgreSQL directly, and records periodic heartbeats. Schedule evaluation, retries, leases, recovery, Redis dispatch, and arbitrary task execution remain out of scope.
+TaskForge currently provides task submission, predefined Go worker handlers, durable worker heartbeats, renewable task leases, and scheduler-driven recovery of expired ownership. PostgreSQL is authoritative for every lifecycle transition. Ordinary handler retries, retry backoff, schedule evaluation, Redis dispatch, and arbitrary task execution remain out of scope.
 
 ## Service boundaries
 
 ### Web (`web`)
 
-The React/TypeScript application is the browser-facing interface. It is built as static assets and served by Nginx. The web service must communicate with TaskForge only through the API; it does not connect directly to PostgreSQL, Redis, the scheduler, or workers.
+The React/TypeScript application is the browser-facing interface. It is built as static assets and served by Nginx. It communicates only through the API and never connects directly to PostgreSQL, Redis, the scheduler, or workers.
 
 ### API (`api`)
 
-The FastAPI service is the public application boundary. It owns request validation and task lifecycle mutations. PostgreSQL is the source of truth for durable state. Clients never depend on PostgreSQL or Redis directly.
-
-The current API exposes `/healthz`, task submission, retrieval, listing, cancellation, and worker list/detail liveness, plus FastAPI's generated documentation.
+FastAPI is the public control-plane boundary. It validates submissions, reads task and ordered attempt history, permits queued-task cancellation, and derives worker liveness for operators. It does not dispatch or execute work. PostgreSQL is the source of every API response.
 
 ### Scheduler (`scheduler`)
 
-The Go scheduler will evaluate persisted schedules and coordinate dispatch of due work. It may read and update scheduling records in PostgreSQL and publish task identifiers to Redis. It must not execute user tasks or serve public product APIs.
+The Go scheduler owns system-driven lifecycle maintenance. Its TF-008 recovery loop:
 
-The current scheduler starts an operational HTTP server with only `/healthz`; it does not inspect schedules or publish messages.
+    Scheduler
+    `-- Recovery Loop
+        |-- find expired RUNNING tasks
+        |-- lock each task with FOR UPDATE SKIP LOCKED
+        |-- validate and mark its current attempt ABANDONED
+        `-- requeue the task or fail it at max_attempts
+
+Each scan has a bounded batch and database timeout. Any scheduler replica may scan; PostgreSQL row locking coordinates replicas without leader election. Recovery uses only `tasks.lease_expires_at <= clock_timestamp()`. Worker heartbeat/liveness never grants or revokes task ownership.
+
+The scheduler exposes only the internal operational `/healthz` endpoint. Schedule evaluation and Redis publication are future responsibilities.
 
 ### Worker (`worker`)
 
-The Go worker registers a process-lifetime instance identity in PostgreSQL, polls for eligible `QUEUED` tasks, atomically claims one task, records an attempt, executes a registered handler, and persists success or failure before polling again. Eligible work is ordered by priority descending, creation time ascending, then task ID ascending. `FOR UPDATE SKIP LOCKED` coordinates simultaneous claimers; ownership transition and attempt creation commit before handler execution begins. The controlled contention proof is documented in `docs/tf-005.md`.
+The Go worker registers a process-lifetime identity, heartbeats independently, polls eligible `QUEUED` rows, atomically claims one task, creates its next numbered attempt, runs an allowlisted handler, renews its lease, and atomically records success or failure. Claim order is priority descending, creation time ascending, then task ID ascending. `FOR UPDATE SKIP LOCKED` coordinates simultaneous workers.
 
-The registry contains `test.echo`, `test.fail`, and a bounded `test.sleep` integration-test handler. Unknown task types fail safely; the worker never executes task-provided code or commands.
+The handler registry contains `test.echo`, `test.fail`, and bounded `test.sleep`. Unknown task types fail safely; task payloads never become executable commands or code.
 
-Each process keeps process liveness separate from per-task ownership:
+Each process separates liveness from ownership:
 
     Worker process
-      |-- process heartbeat loop
-      `-- execution
+      |-- heartbeat loop ---------> workers.last_seen_at
+      `-- task execution
           |-- handler
-          `-- task lease renewal loop
+          `-- lease renewal ------> tasks.lease_expires_at
 
-Registration initializes the heartbeat using PostgreSQL time. The heartbeat loop periodically updates only its worker row. Each claimed task receives a database-time lease and a task-specific renewal goroutine while its handler runs. Completion requires the same worker, attempt, and an unexpired lease. Shutdown cancels these loops and waits before closing the database pool. Worker liveness is derived from heartbeat age; lease validity is derived independently from task ownership. Expired work remains `RUNNING` until a later recovery milestone.
+Renewal and completion require the same task, worker, attempt number, `RUNNING` status, and a strictly unexpired lease. Once the scheduler recovers a task, the old worker cannot renew, succeed, or fail it. A later claim creates attempt `N+1`; recovery itself never creates an attempt.
 
 ### PostgreSQL (`postgres`)
 
-PostgreSQL is the durable system of record for task definitions, lifecycle state, attempts, worker registrations, and results. Schema changes belong in `migrations/`.
+PostgreSQL is the durable coordination mechanism and system of record for tasks, attempts, workers, ownership, results, and recovery. Claim, completion, and recovery each use explicit transactions. Migrations own all schema evolution.
 
 ### Redis (`redis`)
 
-Redis is reserved for future transient coordination. It is not used by the API-to-worker execution path and remains independent of worker startup.
+Redis is provisioned for future transient dispatch and coordination. It is not on the current execution or recovery path.
 
 ## Communication paths
 
-    Browser
-       |
-       | HTTP/JSON
-       v
-    Web (static UI) -------- HTTP/JSON --------> API
-                                                   |
-                                                   | durable reads/writes
-                                                   v
-                                              PostgreSQL
-                                                ^   ^
-                          poll/claim/attempts ---+   +--- schedule queries (future)
-                          results, leases,       |        Scheduler
-                          and heartbeat          |
-                                                |
-                                             Worker
+    Browser --HTTP--> Web --HTTP/JSON--> API -----------+
+                                                       |
+                                                       v
+                                                  PostgreSQL
+                                                   ^   ^   ^
+                                                   |   |   |
+                         poll / claim / renew ------+   |   +------ expired-lease scan
+                         attempts / completion         |           and recovery
+                                                       |                |
+                                                    Worker          Scheduler
 
-    Redis is present for future coordination but is not on this path.
+    Redis is present but unused.
 
-All service-to-service traffic uses Docker Compose's internal DNS names (`api`, `postgres`, and `redis`). Only browser-facing development ports and health endpoints are published to the host.
+Containers use Compose internal DNS. API and web development ports are host-published. Worker and scheduler health endpoints remain internal, so replicas do not compete for host ports.
+
+## Recovery concurrency and failure model
+
+The expired-task query is ordered by lease expiration and uses the partial `tasks_running_lease_idx`. A scanner locks at most its configured batch with `FOR UPDATE SKIP LOCKED`. For every locked task it locks the attempt at `(task_id, attempt_count)` and verifies worker, number, and `RUNNING` status.
+
+Attempt abandonment and task requeue/failure are in the same transaction. A database error rolls back both. A missing or mismatched attempt is reported as `task_recovery_invariant_violation` and left untouched; the scheduler never guesses at corrupted history. Transient scan failures are logged and retried at the next interval without a busy loop.
 
 ## Health and startup
-
-Each container has a health check:
 
 - PostgreSQL uses `pg_isready`.
 - Redis uses `redis-cli ping`.
 - API, scheduler, worker, and web expose `/healthz`.
+- API, scheduler, and worker start after PostgreSQL is healthy.
+- Web starts after API is healthy.
 
-Compose waits for PostgreSQL before starting the API and worker, and waits for the API before starting the web container. The worker registers before starting its polling and heartbeat loops. Worker health endpoints remain internal to the Compose network so replicas do not compete for a host port. HTTP health endpoints report process health; control-plane worker liveness is derived separately from durable heartbeats.
+HTTP health reports process availability. Worker `ACTIVE`/`STALE`/`DEAD` is separately derived from durable heartbeats.
 
 ## Ownership rules
 
-- Public contracts live in the API and are documented in `docs/api.md`.
-- Database evolution is ordered through `migrations/` and recorded in `schema_migrations`; services must not create ad hoc schemas at startup.
-- The worker handler registry is the sole allowlist for executable task types.
-- Scheduler and worker operational endpoints are not product APIs.
-- Cross-service shared source packages should be avoided. Share explicit wire contracts instead, allowing Python, Go, and TypeScript services to evolve independently.
+- Public contracts live in the API and `docs/api.md`.
+- Ordered migrations and `schema_migrations` own database evolution.
+- The worker registry is the only executable-task allowlist.
+- Scheduler and worker health endpoints are operational, not product APIs.
+- Services share durable or wire contracts, not cross-language source packages.
 
 ## Observability
 
-Services currently log to standard output for collection by the container runtime. Future metrics, dashboards, and alerting configuration belong in `monitoring/`. Task IDs are included in worker execution logs; broader correlation IDs can be added when more communication paths exist.
+Services log to standard output. Scheduler recovery logs include the event, task, former worker, attempt number, lease expiration, and action. Empty scans are DEBUG-only. Metrics, dashboards, and alerting are intentionally deferred.
 
 ## Repository layout
 
-    api/          FastAPI service
-    scheduler/    Go scheduler service
-    worker/       Go worker service
+    api/          FastAPI control plane
+    scheduler/    Go lifecycle-maintenance service
+    worker/       Go execution service
     web/          React/TypeScript frontend
     migrations/   PostgreSQL migrations
-    monitoring/   Metrics, dashboards, and alerting
+    monitoring/   Future metrics and dashboards
     tests/        Cross-service and integration tests
     scripts/      Developer and operational scripts
     docs/         Architecture and contract documentation

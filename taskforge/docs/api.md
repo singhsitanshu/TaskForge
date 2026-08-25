@@ -43,6 +43,12 @@ This endpoint changes lifecycle state only. It does not execute tasks or impleme
 
 Task responses expose `claimed_by_worker_id` and `lease_expires_at`. Both are non-null while a task has active or expired `RUNNING` ownership and are cleared on successful or failed completion. The API provides no lease-renewal endpoint; workers renew ownership directly through the repository protocol.
 
+## List task attempts
+
+`GET /tasks/{id}/attempts` returns `{ "items": [...] }` with durable attempt history ordered by `attempt_number` ascending. Unknown tasks return `404`; a task with no attempts returns an empty list.
+
+Each item includes `id`, `task_id`, `worker_id`, `attempt_number`, `status`, `leased_at`, `started_at`, `finished_at`, `output`, `error`, `created_at`, and `updated_at`. `ABANDONED` identifies crash/lease-loss recovery and uses the stable `lease_expired` error. Internal ownership secrets are not exposed.
+
 ## List workers
 
 `GET /workers` returns an object with `items`, `limit`, and `offset`. Workers are ordered by registration time and ID, newest first. Each item includes:

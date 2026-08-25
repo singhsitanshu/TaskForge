@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from app.config import HeartbeatSettings
-from app.domain import NewTask, Task, TaskStatus, Worker, WorkerRecord
+from app.domain import NewTask, Task, TaskAttempt, TaskStatus, Worker, WorkerRecord
 from app.liveness import classify_worker_liveness
 from app.repositories import DuplicateTaskError, TaskRepository, WorkerRepository
 
@@ -60,6 +60,11 @@ class TaskService:
         if task.status is TaskStatus.CANCELLED:
             return task
         raise TaskConflictError(task.status)
+
+    async def list_attempts(self, task_id: UUID) -> Sequence[TaskAttempt]:
+        if await self._repository.get(task_id) is None:
+            raise TaskNotFoundError
+        return await self._repository.list_attempts(task_id)
 
 
 class WorkerService:

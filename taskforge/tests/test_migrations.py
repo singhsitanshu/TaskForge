@@ -27,6 +27,7 @@ EXPECTED_STATUSES = [
     "SUCCEEDED",
     "FAILED",
     "CANCELLED",
+    "ABANDONED",
 ]
 
 
@@ -78,6 +79,7 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 "000002_first_worker_claim",
                 "000003_pre_tf005_remediation",
                 "000004_task_leases",
+                "000005_expired_lease_recovery",
             ]
 
             statuses = [
@@ -200,6 +202,43 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 """,
                 (task_id, worker_id),
             )
+
+            abandoned_task_id = fetch_scalar(
+                connection,
+                """
+                INSERT INTO tasks (task_type)
+                VALUES ('abandoned-attempt-constraint')
+                RETURNING id
+                """,
+            )
+            connection.execute(
+                """
+                INSERT INTO task_attempts (
+                    task_id,
+                    worker_id,
+                    attempt_number,
+                    status,
+                    started_at,
+                    finished_at,
+                    error
+                )
+                VALUES (
+                    %s, %s, 1, 'ABANDONED',
+                    clock_timestamp(), clock_timestamp(), 'lease_expired'
+                )
+                """,
+                (abandoned_task_id, worker_id),
+            )
+
+            with pytest.raises(errors.CheckViolation):
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'ABANDONED'
+                    WHERE id = %s
+                    """,
+                    (abandoned_task_id,),
+                )
 
             with pytest.raises(errors.UniqueViolation):
                 connection.execute(
