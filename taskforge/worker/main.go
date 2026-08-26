@@ -22,6 +22,7 @@ import (
 
 	workerconfig "taskforge/worker/internal/config"
 	"taskforge/worker/internal/handler"
+	workermetrics "taskforge/worker/internal/metrics"
 	"taskforge/worker/internal/repository"
 	workerservice "taskforge/worker/internal/service"
 )
@@ -76,6 +77,7 @@ func run() error {
 	}
 
 	store := repository.NewPostgres(pool)
+	metrics := workermetrics.New()
 	workerID, err := store.RegisterWorker(ctx, identity.InstanceID, identity.Name)
 	if err != nil {
 		return err
@@ -88,7 +90,7 @@ func run() error {
 		heartbeatConfig.Interval,
 	)
 
-	worker := workerservice.New(
+	worker := workerservice.NewObserved(
 		store,
 		handler.NewRegistry(),
 		workerID,
@@ -98,21 +100,25 @@ func run() error {
 		leaseConfig.RenewInterval,
 		leaseConfig.RenewTimeout,
 		log.Default(),
+		metrics,
 		func(retryIndex int) time.Duration {
 			return retryConfig.Delay(retryIndex, mathrand.Float64())
 		},
 	)
-	heartbeater := workerservice.NewHeartbeater(
+	heartbeater := workerservice.NewObservedHeartbeater(
 		store,
 		workerID,
 		identity.InstanceID,
 		heartbeatConfig.Interval,
 		heartbeatConfig.Timeout,
 		log.Default(),
+		metrics,
 	)
 	server := &http.Server{
-		Addr:              envOrDefault("HTTP_ADDR", ":8080"),
-		Handler:           newMux(),
+		Addr: envOrDefault("HTTP_ADDR", ":8080"),
+		Handler: newOperationalMux(metrics.Handler(), func(ctx context.Context) error {
+			return pool.Ping(ctx)
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -164,6 +170,15 @@ func run() error {
 }
 
 func newMux() http.Handler {
+	return newOperationalMux(http.NotFoundHandler(), func(context.Context) error {
+		return nil
+	})
+}
+
+func newOperationalMux(
+	metricsHandler http.Handler,
+	readinessCheck func(context.Context) error,
+) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -172,6 +187,24 @@ func newMux() http.Handler {
 			"status":  "ok",
 		})
 	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, request *http.Request) {
+		ctx, cancel := context.WithTimeout(request.Context(), time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		if err := readinessCheck(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"service": "worker",
+				"status":  "not_ready",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"service": "worker",
+			"status":  "ready",
+		})
+	})
+	mux.Handle("GET /metrics", metricsHandler)
 	return mux
 }
 

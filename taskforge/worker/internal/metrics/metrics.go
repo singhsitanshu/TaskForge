@@ -14,19 +14,19 @@ var (
 )
 
 type Metrics struct {
-	registry              *prometheus.Registry
-	tasksClaimed          prometheus.Counter
-	tasksCompleted        *prometheus.CounterVec
-	attempts               *prometheus.CounterVec
-	heartbeats             *prometheus.CounterVec
-	leaseRenewals          *prometheus.CounterVec
-	retriesScheduled       prometheus.Counter
-	claimDuration          prometheus.Histogram
-	executionDuration      prometheus.Histogram
-	queueWait              prometheus.Histogram
-	leaseRenewDuration     prometheus.Histogram
-	retryDelay             prometheus.Histogram
-	taskTotalLatency       prometheus.Histogram
+	registry           *prometheus.Registry
+	tasksClaimed       prometheus.Counter
+	tasksCompleted     *prometheus.CounterVec
+	attempts           *prometheus.CounterVec
+	heartbeats         *prometheus.CounterVec
+	leaseRenewals      *prometheus.CounterVec
+	retriesScheduled   prometheus.Counter
+	claimDuration      prometheus.Histogram
+	executionDuration  prometheus.Histogram
+	queueWait          prometheus.Histogram
+	leaseRenewDuration prometheus.Histogram
+	retryDelay         prometheus.Histogram
+	taskTotalLatency   prometheus.Histogram
 }
 
 func New() *Metrics {
@@ -84,7 +84,7 @@ func New() *Metrics {
 		}),
 		taskTotalLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "taskforge_task_total_latency_seconds",
-			Help:    "Task creation-to-terminal latency observed by workers.",
+			Help:    "Task creation-to-terminal latency.",
 			Buckets: taskBuckets,
 		}),
 	}
@@ -136,6 +136,10 @@ func (metrics *Metrics) Heartbeat(outcome string) {
 func (metrics *Metrics) LeaseRenewal(outcome string, duration time.Duration) {
 	metrics.leaseRenewals.WithLabelValues(outcome).Inc()
 	metrics.leaseRenewDuration.Observe(nonNegative(duration))
+}
+
+func (metrics *Metrics) LeaseLost() {
+	metrics.leaseRenewals.WithLabelValues("lost").Inc()
 }
 
 func (metrics *Metrics) RetryScheduled(delay time.Duration) {

@@ -27,6 +27,9 @@ RUN pip install --no-cache-dir \
 
 COPY api/app ./api/app
 COPY api/tests ./api/tests
+COPY worker/internal/metrics ./worker/internal/metrics
+COPY scheduler/internal/metrics ./scheduler/internal/metrics
+COPY monitoring ./monitoring
 COPY --from=worker-build /out/taskforge-worker /usr/local/bin/taskforge-worker
 COPY --from=worker-build /out/taskforge-claim-harness /usr/local/bin/taskforge-claim-harness
 COPY --from=scheduler-build /out/taskforge-scheduler /usr/local/bin/taskforge-scheduler
@@ -39,7 +42,8 @@ COPY tests/test_claim_races.py ./tests/test_claim_races.py
 COPY tests/test_worker_api.py ./tests/test_worker_api.py
 COPY tests/test_worker_heartbeat.py ./tests/test_worker_heartbeat.py
 COPY tests/test_recovery_e2e.py ./tests/test_recovery_e2e.py
+COPY tests/test_monitoring_config.py ./tests/test_monitoring_config.py
 
 ENV PYTHONPATH=/workspace/api
 
-CMD ["pytest", "-q", "api/tests", "tests/test_migrations.py", "tests/test_task_api.py", "tests/test_idempotency_api.py", "tests/test_worker_e2e.py", "tests/test_claim_races.py", "tests/test_worker_api.py", "tests/test_worker_heartbeat.py", "tests/test_recovery_e2e.py"]
+CMD ["pytest", "-q", "api/tests", "tests/test_migrations.py", "tests/test_task_api.py", "tests/test_idempotency_api.py", "tests/test_worker_e2e.py", "tests/test_claim_races.py", "tests/test_worker_api.py", "tests/test_worker_heartbeat.py", "tests/test_recovery_e2e.py", "tests/test_monitoring_config.py"]

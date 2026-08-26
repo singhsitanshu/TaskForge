@@ -19,7 +19,9 @@ type RecoveredTask struct {
 	OldWorkerID    string
 	AttemptNumber  int16
 	LeaseExpiresAt time.Time
+	RecoveryLag    time.Duration
 	Action         RecoveryAction
+	TotalLatency   time.Duration
 }
 
 type InvariantViolation struct {
@@ -39,4 +41,13 @@ type PromotedTask struct {
 	TaskID        string
 	AttemptNumber int16
 	ScheduledAt   time.Time
+	Lateness      time.Duration
+}
+
+type GlobalSnapshot struct {
+	TaskCounts           map[string]int64
+	WorkerCounts         map[string]int64
+	RunningAttempts      int64
+	EligibleTasks        int64
+	ExpiredRunningLeases int64
 }

@@ -13,10 +13,23 @@ type RecoveryStore interface {
 	RecoverExpired(context.Context, int) (domain.RecoveryBatch, error)
 }
 
+type RecoveryMetrics interface {
+	RecoveryBatch(time.Duration, error)
+	Recovered(string, time.Duration)
+	TaskTotalLatency(time.Duration)
+}
+
+type noopRecoveryMetrics struct{}
+
+func (noopRecoveryMetrics) RecoveryBatch(time.Duration, error) {}
+func (noopRecoveryMetrics) Recovered(string, time.Duration)    {}
+func (noopRecoveryMetrics) TaskTotalLatency(time.Duration)     {}
+
 type Recovery struct {
-	store  RecoveryStore
-	config config.Recovery
-	logger *slog.Logger
+	store   RecoveryStore
+	config  config.Recovery
+	logger  *slog.Logger
+	metrics RecoveryMetrics
 }
 
 func NewRecovery(
@@ -24,7 +37,18 @@ func NewRecovery(
 	configuration config.Recovery,
 	logger *slog.Logger,
 ) *Recovery {
-	return &Recovery{store: store, config: configuration, logger: logger}
+	return NewObservedRecovery(store, configuration, logger, noopRecoveryMetrics{})
+}
+
+func NewObservedRecovery(
+	store RecoveryStore,
+	configuration config.Recovery,
+	logger *slog.Logger,
+	metrics RecoveryMetrics,
+) *Recovery {
+	return &Recovery{
+		store: store, config: configuration, logger: logger, metrics: metrics,
+	}
 }
 
 func (recovery *Recovery) Run(ctx context.Context) {
@@ -43,6 +67,7 @@ func (recovery *Recovery) Run(ctx context.Context) {
 }
 
 func (recovery *Recovery) scan(ctx context.Context) {
+	started := time.Now()
 	operationContext, cancel := context.WithTimeout(ctx, recovery.config.DBTimeout)
 	defer cancel()
 
@@ -50,6 +75,7 @@ func (recovery *Recovery) scan(ctx context.Context) {
 		operationContext,
 		recovery.config.BatchSize,
 	)
+	recovery.metrics.RecoveryBatch(time.Since(started), err)
 	if err != nil {
 		if ctx.Err() == nil {
 			recovery.logger.Error(
@@ -67,9 +93,13 @@ func (recovery *Recovery) scan(ctx context.Context) {
 
 	for _, task := range batch.Recovered {
 		event := "task_recovered"
+		outcome := "requeued"
 		if task.Action == domain.RecoveryFailed {
 			event = "task_recovery_exhausted"
+			outcome = "exhausted"
+			recovery.metrics.TaskTotalLatency(task.TotalLatency)
 		}
+		recovery.metrics.Recovered(outcome, task.RecoveryLag)
 		recovery.logger.Info(
 			"expired task ownership recovered",
 			"event", event,

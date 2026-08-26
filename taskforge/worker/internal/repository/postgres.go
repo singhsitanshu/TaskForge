@@ -330,20 +330,21 @@ func (r *Postgres) RetryableFail(
 			  AND claimed_by_worker_id = $2::uuid
 			  AND attempt_count = $3
 			  AND lease_expires_at > clock_timestamp()
+			RETURNING completed_at
 		`
-		commandTag, err = tx.Exec(
+		err = tx.QueryRow(
 			ctx,
 			exhaustRetry,
 			task.ID,
 			workerID,
 			task.AttemptNumber,
 			message,
-		)
+		).Scan(&outcome.CompletedAt)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.RetryOutcome{}, domain.ErrLeaseLost
+			}
 			return domain.RetryOutcome{}, fmt.Errorf("exhaust task retries: %w", err)
-		}
-		if commandTag.RowsAffected() != 1 {
-			return domain.RetryOutcome{}, domain.ErrLeaseLost
 		}
 	}
 
@@ -437,7 +438,7 @@ func completeSuccess(
 	workerID string,
 	result string,
 ) error {
-	commandTag, err := tx.Exec(
+	err := tx.QueryRow(
 		ctx,
 		`
 			UPDATE tasks
@@ -453,20 +454,21 @@ func completeSuccess(
 			  AND claimed_by_worker_id = $2::uuid
 			  AND attempt_count = $3
 			  AND lease_expires_at > clock_timestamp()
+			RETURNING completed_at
 		`,
 		task.ID,
 		workerID,
 		task.AttemptNumber,
 		result,
-	)
+	).Scan(&task.CompletedAt)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrLeaseLost
+		}
 		return fmt.Errorf("mark task succeeded: %w", err)
 	}
-	if commandTag.RowsAffected() != 1 {
-		return domain.ErrLeaseLost
-	}
 
-	commandTag, err = tx.Exec(
+	commandTag, err := tx.Exec(
 		ctx,
 		`
 			UPDATE task_attempts
@@ -503,7 +505,7 @@ func completeFailure(
 	workerID string,
 	message string,
 ) error {
-	commandTag, err := tx.Exec(
+	err := tx.QueryRow(
 		ctx,
 		`
 			UPDATE tasks
@@ -519,20 +521,21 @@ func completeFailure(
 			  AND claimed_by_worker_id = $2::uuid
 			  AND attempt_count = $3
 			  AND lease_expires_at > clock_timestamp()
+			RETURNING completed_at
 		`,
 		task.ID,
 		workerID,
 		task.AttemptNumber,
 		message,
-	)
+	).Scan(&task.CompletedAt)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrLeaseLost
+		}
 		return fmt.Errorf("mark task failed: %w", err)
 	}
-	if commandTag.RowsAffected() != 1 {
-		return domain.ErrLeaseLost
-	}
 
-	commandTag, err = tx.Exec(
+	commandTag, err := tx.Exec(
 		ctx,
 		`
 			UPDATE task_attempts

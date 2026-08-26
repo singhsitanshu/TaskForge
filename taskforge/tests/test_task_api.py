@@ -132,6 +132,15 @@ def test_submit_get_list_and_cancel(
         ).fetchone()[0]
     assert attempts_before == attempts_after == 0
 
+    metrics_response = api_client.get("/metrics")
+    assert metrics_response.status_code == 200
+    assert "text/plain" in metrics_response.headers["content-type"]
+    metrics_text = metrics_response.text
+    assert 'taskforge_task_submissions_total{outcome="created"}' in metrics_text
+    assert 'taskforge_task_cancellations_total{outcome="cancelled"}' in metrics_text
+    assert 'route="/tasks/{task_id}"' in metrics_text
+    assert task_id not in metrics_text
+
 
 def test_deprecated_body_idempotency_key_replays_globally(
     api_client: TestClient,

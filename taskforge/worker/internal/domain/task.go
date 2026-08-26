@@ -35,9 +35,10 @@ type ExecutionMetadata struct {
 }
 
 type RetryOutcome struct {
-	RetryAt   time.Time
-	Delay     time.Duration
-	Exhausted bool
+	RetryAt     time.Time
+	CompletedAt time.Time
+	Delay       time.Duration
+	Exhausted   bool
 }
 
 type ClaimedTask struct {
@@ -48,6 +49,7 @@ type ClaimedTask struct {
 	CreatedAt      time.Time
 	QueuedAt       time.Time
 	StartedAt      time.Time
+	CompletedAt    time.Time
 	Type           string
 	Payload        json.RawMessage
 }

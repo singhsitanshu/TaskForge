@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"taskforge/scheduler/internal/config"
+	schedulermetrics "taskforge/scheduler/internal/metrics"
 	"taskforge/scheduler/internal/repository"
 	"taskforge/scheduler/internal/service"
 )
@@ -41,6 +42,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	metricsConfig, err := config.MetricsFromEnv()
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -62,15 +67,20 @@ func run(logger *slog.Logger) error {
 	}
 
 	store := repository.NewPostgres(pool)
-	recovery := service.NewRecovery(
+	metrics := schedulermetrics.New()
+	recovery := service.NewObservedRecovery(
 		store,
 		recoveryConfig,
 		logger,
+		metrics,
 	)
-	promotion := service.NewRetryPromotion(store, promotionConfig, logger)
+	promotion := service.NewObservedRetryPromotion(store, promotionConfig, logger, metrics)
+	collector := service.NewCollector(store, metricsConfig, logger, metrics)
 	server := &http.Server{
-		Addr:              envOrDefault("HTTP_ADDR", ":8080"),
-		Handler:           newMux(),
+		Addr: envOrDefault("HTTP_ADDR", ":8080"),
+		Handler: newOperationalMux(metrics.Handler(), func(ctx context.Context) error {
+			return pool.Ping(ctx)
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -86,6 +96,8 @@ func run(logger *slog.Logger) error {
 			"retry_promotion_interval", promotionConfig.Interval,
 			"retry_promotion_batch_size", promotionConfig.BatchSize,
 			"retry_promotion_db_timeout", promotionConfig.DBTimeout,
+			"metrics_interval", metricsConfig.Interval,
+			"metrics_db_timeout", metricsConfig.DBTimeout,
 		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrors <- err
@@ -93,7 +105,7 @@ func run(logger *slog.Logger) error {
 	}()
 
 	var lifecycle sync.WaitGroup
-	lifecycle.Add(2)
+	lifecycle.Add(3)
 	go func() {
 		defer lifecycle.Done()
 		recovery.Run(ctx)
@@ -101,6 +113,10 @@ func run(logger *slog.Logger) error {
 	go func() {
 		defer lifecycle.Done()
 		promotion.Run(ctx)
+	}()
+	go func() {
+		defer lifecycle.Done()
+		collector.Run(ctx)
 	}()
 
 	var runErr error
@@ -122,6 +138,15 @@ func run(logger *slog.Logger) error {
 }
 
 func newMux() http.Handler {
+	return newOperationalMux(http.NotFoundHandler(), func(context.Context) error {
+		return nil
+	})
+}
+
+func newOperationalMux(
+	metricsHandler http.Handler,
+	readinessCheck func(context.Context) error,
+) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -130,6 +155,24 @@ func newMux() http.Handler {
 			"status":  "ok",
 		})
 	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, request *http.Request) {
+		ctx, cancel := context.WithTimeout(request.Context(), time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		if err := readinessCheck(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"service": "scheduler",
+				"status":  "not_ready",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"service": "scheduler",
+			"status":  "ready",
+		})
+	})
+	mux.Handle("GET /metrics", metricsHandler)
 	return mux
 }
 

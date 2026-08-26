@@ -1,7 +1,9 @@
 import os
 import re
+import socket
 import subprocess
 import time
+import urllib.request
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -120,11 +122,18 @@ def stop_worker(process: subprocess.Popen) -> str:
     return read_output(process)
 
 
+def unused_tcp_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
 def test_api_submission_worker_execution_and_poll_again(
     worker_environment: tuple[str, TestClient],
 ) -> None:
     schema_name, client = worker_environment
     worker_name = f"e2e-worker-{uuid.uuid4().hex}"
+    metrics_port = unused_tcp_port()
     environment = os.environ.copy()
     environment.update(
         {
@@ -133,7 +142,7 @@ def test_api_submission_worker_execution_and_poll_again(
             "WORKER_ID": worker_name,
             "WORKER_NAME": worker_name,
             "POLL_INTERVAL": "20ms",
-            "HTTP_ADDR": "127.0.0.1:0",
+            "HTTP_ADDR": f"127.0.0.1:{metrics_port}",
         }
     )
     process = subprocess.Popen(
@@ -208,6 +217,21 @@ def test_api_submission_worker_execution_and_poll_again(
             ("SUCCEEDED",),
             ("SUCCEEDED",),
         ]
+
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{metrics_port}/readyz", timeout=2
+        ) as response:
+            assert response.status == 200
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{metrics_port}/metrics", timeout=2
+        ) as response:
+            assert "text/plain" in response.headers["Content-Type"]
+            metrics_text = response.read().decode()
+        assert "taskforge_worker_tasks_claimed_total 3" in metrics_text
+        assert 'taskforge_worker_tasks_completed_total{outcome="success"} 2' in metrics_text
+        assert 'taskforge_worker_tasks_completed_total{outcome="terminal_failure"} 1' in metrics_text
+        assert "taskforge_task_queue_wait_seconds_count 3" in metrics_text
+        assert first_response.json()["id"] not in metrics_text
     finally:
         output = stop_worker(process)
         assert process.returncode == 0, output

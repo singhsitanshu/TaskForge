@@ -12,6 +12,8 @@ TaskForge is a service-oriented task orchestration platform. The current milesto
 | `web` | React / TypeScript | 3000 | Browser interface |
 | `postgres` | PostgreSQL | 5432 | Durable application state |
 | `redis` | Redis | 6379 | Future queueing and short-lived coordination |
+| `prometheus` | Prometheus | 9090 | Scrapes all API, worker, and scheduler replicas |
+| `grafana` | Grafana | 3001 | Provisioned TaskForge operational dashboard |
 
 ## Quick start
 
@@ -20,7 +22,7 @@ TaskForge is a service-oriented task orchestration platform. The current milesto
     make up
     make health
 
-Open the web app at <http://localhost:3000> and the API documentation at <http://localhost:8000/docs>.
+Open the web app at <http://localhost:3000>, API documentation at <http://localhost:8000/docs>, Prometheus at <http://localhost:9090>, and Grafana at <http://localhost:3001>.
 
 ## Developer commands
 
@@ -33,9 +35,11 @@ Open the web app at <http://localhost:3000> and the API documentation at <http:/
     make test-recovery  # Run scheduler recovery tests with Go race detection
     make test-retries   # Run retry scheduling, promotion, and E2E proofs
     make test-idempotency # Run submission replay and contention proofs
+    make test-observability # Run metrics, readiness, collector, and monitoring tests
     make migrate-up    # Apply the PostgreSQL schema
     make migrate-down  # Roll back the PostgreSQL schema
     make down          # Stop the local stack
 
 See [docs/architecture.md](docs/architecture.md) for service boundaries and communication paths.
 See [docs/tf-010.md](docs/tf-010.md) for the idempotent-submission contract and execution guarantee boundary.
+See [docs/tf-011.md](docs/tf-011.md) for metrics, cardinality, latency, and health/readiness contracts.

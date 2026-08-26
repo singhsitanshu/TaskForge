@@ -17,11 +17,12 @@ type Postgres struct {
 }
 
 type expiredTask struct {
-	id             string
-	workerID       string
-	attemptNumber  int16
-	maxAttempts    int16
-	leaseExpiresAt time.Time
+	id               string
+	workerID         string
+	attemptNumber    int16
+	maxAttempts      int16
+	leaseExpiresAt   time.Time
+	recoveryLagNanos int64
 }
 
 type activeAttempt struct {
@@ -33,6 +34,98 @@ type activeAttempt struct {
 
 func NewPostgres(pool *pgxpool.Pool) *Postgres {
 	return &Postgres{pool: pool}
+}
+
+func (repository *Postgres) CollectSnapshot(
+	ctx context.Context,
+	staleAfter time.Duration,
+	deadAfter time.Duration,
+) (domain.GlobalSnapshot, error) {
+	connection, err := repository.pool.Acquire(ctx)
+	if err != nil {
+		return domain.GlobalSnapshot{}, fmt.Errorf("acquire snapshot connection: %w", err)
+	}
+	defer connection.Release()
+
+	snapshot := domain.GlobalSnapshot{
+		TaskCounts:   make(map[string]int64),
+		WorkerCounts: make(map[string]int64),
+	}
+	taskRows, err := connection.Query(ctx, `
+		SELECT status::text, count(*)
+		FROM tasks
+		GROUP BY status
+	`)
+	if err != nil {
+		return domain.GlobalSnapshot{}, fmt.Errorf("collect task status counts: %w", err)
+	}
+	for taskRows.Next() {
+		var status string
+		var count int64
+		if err := taskRows.Scan(&status, &count); err != nil {
+			taskRows.Close()
+			return domain.GlobalSnapshot{}, fmt.Errorf("scan task status count: %w", err)
+		}
+		snapshot.TaskCounts[status] = count
+	}
+	if err := taskRows.Err(); err != nil {
+		taskRows.Close()
+		return domain.GlobalSnapshot{}, fmt.Errorf("read task status counts: %w", err)
+	}
+	taskRows.Close()
+
+	workerRows, err := connection.Query(ctx, `
+		SELECT liveness, count(*)
+		FROM (
+			SELECT CASE
+				WHEN last_seen_at IS NULL
+				  OR last_seen_at <= clock_timestamp() - ($2 * interval '1 microsecond')
+					THEN 'DEAD'
+				WHEN last_seen_at <= clock_timestamp() - ($1 * interval '1 microsecond')
+					THEN 'STALE'
+				ELSE 'ACTIVE'
+			END AS liveness
+			FROM workers
+		) AS classified
+		GROUP BY liveness
+	`, staleAfter.Microseconds(), deadAfter.Microseconds())
+	if err != nil {
+		return domain.GlobalSnapshot{}, fmt.Errorf("collect worker liveness counts: %w", err)
+	}
+	for workerRows.Next() {
+		var liveness string
+		var count int64
+		if err := workerRows.Scan(&liveness, &count); err != nil {
+			workerRows.Close()
+			return domain.GlobalSnapshot{}, fmt.Errorf("scan worker liveness count: %w", err)
+		}
+		snapshot.WorkerCounts[liveness] = count
+	}
+	if err := workerRows.Err(); err != nil {
+		workerRows.Close()
+		return domain.GlobalSnapshot{}, fmt.Errorf("read worker liveness counts: %w", err)
+	}
+	workerRows.Close()
+
+	err = connection.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM task_attempts WHERE status = 'RUNNING'),
+			(SELECT count(*) FROM tasks
+			 WHERE status = 'QUEUED'
+			   AND scheduled_at <= clock_timestamp()
+			   AND attempt_count < max_attempts),
+			(SELECT count(*) FROM tasks
+			 WHERE status = 'RUNNING'
+			   AND lease_expires_at <= clock_timestamp())
+	`).Scan(
+		&snapshot.RunningAttempts,
+		&snapshot.EligibleTasks,
+		&snapshot.ExpiredRunningLeases,
+	)
+	if err != nil {
+		return domain.GlobalSnapshot{}, fmt.Errorf("collect operational counts: %w", err)
+	}
+	return snapshot, nil
 }
 
 func (repository *Postgres) PromoteDueRetries(
@@ -62,7 +155,11 @@ func (repository *Postgres) PromoteDueRetries(
 		FROM due
 		WHERE task.id = due.id
 		  AND task.status = 'RETRYING'
-		RETURNING task.id::text, task.attempt_count, task.scheduled_at
+		RETURNING
+			task.id::text,
+			task.attempt_count,
+			task.scheduled_at,
+			(EXTRACT(EPOCH FROM (clock_timestamp() - task.scheduled_at)) * 1000000000)::bigint
 	`
 	rows, err := tx.Query(ctx, query, batchSize)
 	if err != nil {
@@ -71,10 +168,17 @@ func (repository *Postgres) PromoteDueRetries(
 	promoted := make([]domain.PromotedTask, 0, batchSize)
 	for rows.Next() {
 		var task domain.PromotedTask
-		if err := rows.Scan(&task.TaskID, &task.AttemptNumber, &task.ScheduledAt); err != nil {
+		var latenessNanos int64
+		if err := rows.Scan(
+			&task.TaskID,
+			&task.AttemptNumber,
+			&task.ScheduledAt,
+			&latenessNanos,
+		); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan promoted retry: %w", err)
 		}
+		task.Lateness = time.Duration(latenessNanos)
 		promoted = append(promoted, task)
 	}
 	if err := rows.Err(); err != nil {
@@ -138,7 +242,8 @@ func (repository *Postgres) RecoverExpired(
 		if task.attemptNumber >= task.maxAttempts {
 			action = domain.RecoveryFailed
 		}
-		if err := transitionTask(ctx, tx, task, action); err != nil {
+		totalLatency, err := transitionTask(ctx, tx, task, action)
+		if err != nil {
 			return domain.RecoveryBatch{}, err
 		}
 		batch.Recovered = append(batch.Recovered, domain.RecoveredTask{
@@ -146,7 +251,9 @@ func (repository *Postgres) RecoverExpired(
 			OldWorkerID:    task.workerID,
 			AttemptNumber:  task.attemptNumber,
 			LeaseExpiresAt: task.leaseExpiresAt,
+			RecoveryLag:    time.Duration(task.recoveryLagNanos),
 			Action:         action,
+			TotalLatency:   totalLatency,
 		})
 	}
 
@@ -163,7 +270,8 @@ func lockExpiredTasks(ctx context.Context, tx pgx.Tx, batchSize int) ([]expiredT
 			task.claimed_by_worker_id::text,
 			task.attempt_count,
 			task.max_attempts,
-			task.lease_expires_at
+			task.lease_expires_at,
+			(EXTRACT(EPOCH FROM (clock_timestamp() - task.lease_expires_at)) * 1000000000)::bigint
 		FROM tasks AS task
 		WHERE task.status = 'RUNNING'
 		  AND task.lease_expires_at <= clock_timestamp()
@@ -186,6 +294,7 @@ func lockExpiredTasks(ctx context.Context, tx pgx.Tx, batchSize int) ([]expiredT
 			&task.attemptNumber,
 			&task.maxAttempts,
 			&task.leaseExpiresAt,
+			&task.recoveryLagNanos,
 		); err != nil {
 			return nil, fmt.Errorf("scan expired task: %w", err)
 		}
@@ -266,7 +375,7 @@ func transitionTask(
 	tx pgx.Tx,
 	task expiredTask,
 	action domain.RecoveryAction,
-) error {
+) (time.Duration, error) {
 	status := "QUEUED"
 	lastError := domain.AttemptAbandonReason
 	completionExpression := "NULL"
@@ -278,9 +387,9 @@ func transitionTask(
 	query := fmt.Sprintf(`
 		UPDATE tasks
 		SET
-			status = $5,
+			status = $5::task_status,
 			queued_at = CASE
-				WHEN $5 = 'QUEUED' THEN clock_timestamp()
+				WHEN $5::task_status = 'QUEUED' THEN clock_timestamp()
 				ELSE queued_at
 			END,
 			claimed_by_worker_id = NULL,
@@ -294,8 +403,10 @@ func transitionTask(
 		  AND attempt_count = $3
 		  AND lease_expires_at = $4
 		  AND lease_expires_at <= clock_timestamp()
+		RETURNING COALESCE(EXTRACT(EPOCH FROM (completed_at - created_at)), 0)
 	`, completionExpression)
-	commandTag, err := tx.Exec(
+	var totalLatencySeconds float64
+	err := tx.QueryRow(
 		ctx,
 		query,
 		task.id,
@@ -304,14 +415,14 @@ func transitionTask(
 		task.leaseExpiresAt,
 		status,
 		lastError,
-	)
+	).Scan(&totalLatencySeconds)
 	if err != nil {
-		return fmt.Errorf("transition recovered task %s: %w", task.id, err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, fmt.Errorf("transition recovered task %s: ownership changed", task.id)
+		}
+		return 0, fmt.Errorf("transition recovered task %s: %w", task.id, err)
 	}
-	if commandTag.RowsAffected() != 1 {
-		return fmt.Errorf("transition recovered task %s: ownership changed", task.id)
-	}
-	return nil
+	return time.Duration(totalLatencySeconds * float64(time.Second)), nil
 }
 
 func violation(task expiredTask, reason string) domain.InvariantViolation {

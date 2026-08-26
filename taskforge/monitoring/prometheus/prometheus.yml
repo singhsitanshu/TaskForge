@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: taskforge-api
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: taskforge-worker
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 8080
+        refresh_interval: 5s
+
+  - job_name: taskforge-scheduler
+    dns_sd_configs:
+      - names: ["scheduler"]
+        type: A
+        port: 8080
+        refresh_interval: 5s

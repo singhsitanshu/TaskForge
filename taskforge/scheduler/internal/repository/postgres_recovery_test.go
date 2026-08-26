@@ -47,6 +47,15 @@ type runningTask struct {
 func TestSingleExpiredTaskRecovery(t *testing.T) {
 	database := newTestDatabase(t)
 	task := insertRunningTask(t, database, 1, 3, -time.Second, "")
+	var queuedBefore time.Time
+	if err := database.pool.QueryRow(
+		context.Background(),
+		"SELECT queued_at FROM tasks WHERE id = $1::uuid",
+		task.id,
+	).Scan(&queuedBefore); err != nil {
+		t.Fatalf("read pre-recovery queued_at: %v", err)
+	}
+	time.Sleep(time.Millisecond)
 
 	batch, err := database.store.RecoverExpired(context.Background(), 100)
 	if err != nil {
@@ -58,13 +67,52 @@ func TestSingleExpiredTaskRecovery(t *testing.T) {
 	if batch.Recovered[0].Action != domain.RecoveryRequeued {
 		t.Fatalf("unexpected action: %+v", batch.Recovered[0])
 	}
+	if batch.Recovered[0].RecoveryLag < time.Second || batch.Recovered[0].RecoveryLag > 5*time.Second {
+		t.Fatalf("unexpected database recovery lag: %s", batch.Recovered[0].RecoveryLag)
+	}
 
 	assertTaskState(t, database, task.id, "QUEUED", 1, nil, nil, "lease_expired")
 	assertAttemptState(t, database, task.id, 1, task.workerID, "ABANDONED", "lease_expired")
+	var queuedAfter time.Time
+	if err := database.pool.QueryRow(
+		context.Background(),
+		"SELECT queued_at FROM tasks WHERE id = $1::uuid",
+		task.id,
+	).Scan(&queuedAfter); err != nil {
+		t.Fatalf("read recovered queued_at: %v", err)
+	}
+	if !queuedAfter.After(queuedBefore) {
+		t.Fatalf("queued_at was not reset: before=%s after=%s", queuedBefore, queuedAfter)
+	}
 
 	second, err := database.store.RecoverExpired(context.Background(), 100)
 	if err != nil || len(second.Recovered) != 0 || len(second.Violations) != 0 {
 		t.Fatalf("task recovered more than once: batch=%+v error=%v", second, err)
+	}
+}
+
+func TestRecoveryUsesExtendedQueryProtocol(t *testing.T) {
+	database := newTestDatabase(t)
+	task := insertRunningTask(t, database, 1, 1, -time.Second, "extended-protocol")
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	configuration, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatalf("parse extended protocol pool: %v", err)
+	}
+	configuration.ConnConfig.RuntimeParams["search_path"] = database.schema
+	extendedPool, err := pgxpool.NewWithConfig(context.Background(), configuration)
+	if err != nil {
+		t.Fatalf("create extended protocol pool: %v", err)
+	}
+	defer extendedPool.Close()
+
+	batch, err := repository.NewPostgres(extendedPool).RecoverExpired(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("extended-protocol recovery: %v", err)
+	}
+	if len(batch.Recovered) != 1 || batch.Recovered[0].TaskID != task.id ||
+		batch.Recovered[0].Action != domain.RecoveryFailed {
+		t.Fatalf("unexpected extended-protocol batch: %+v", batch)
 	}
 }
 

@@ -1,4 +1,4 @@
-.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases
+.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability
 
 build:
 	docker compose build
@@ -18,6 +18,18 @@ health:
 	@docker compose exec -T worker wget --quiet --tries=1 --spider http://127.0.0.1:8080/healthz
 	@curl --fail --silent http://localhost:$${WEB_PORT:-3000}/healthz
 	@printf '\nAll HTTP services are healthy.\n'
+
+readiness:
+	@curl --fail --silent http://localhost:$${API_PORT:-8000}/readyz
+	@docker compose exec -T scheduler wget --quiet --tries=1 --spider http://127.0.0.1:8080/readyz
+	@docker compose exec -T worker wget --quiet --tries=1 --spider http://127.0.0.1:8080/readyz
+	@printf '\nTaskForge processing services are ready.\n'
+
+metrics:
+	@curl --fail --silent http://localhost:$${API_PORT:-8000}/metrics >/dev/null
+	@curl --fail --silent http://localhost:$${PROMETHEUS_PORT:-9090}/-/ready >/dev/null
+	@curl --fail --silent http://localhost:$${GRAFANA_PORT:-3001}/api/health >/dev/null
+	@printf 'API metrics, Prometheus, and Grafana are reachable.\n'
 
 lint:
 	cd api && python -m ruff check .
@@ -83,3 +95,7 @@ test-heartbeats:
 test-leases:
 	docker compose --profile test run --rm --build claim-tests
 	docker compose --profile test run --rm --build integration-tests pytest -q -s tests/test_worker_heartbeat.py
+
+test-observability:
+	docker compose --profile test run --rm --build integration-tests pytest -q api/tests/test_metrics.py tests/test_monitoring_config.py tests/test_task_api.py tests/test_worker_e2e.py
+	docker compose --profile test run --rm --build recovery-tests go test -race -v -count=1 ./internal/metrics ./internal/service ./internal/repository -run 'Metrics|Collector|Snapshot|Recovery|RetryPromotion'

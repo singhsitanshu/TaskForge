@@ -14,12 +14,25 @@ func TestClaimCreatesAtomicFutureLease(t *testing.T) {
 	database := newTestDatabase(t)
 	worker := registerWorkers(t, database, 1)[0]
 	taskID := insertTask(t, database, 0, time.Time{}, "")
+	_, err := database.pool.Exec(context.Background(), `
+		UPDATE tasks
+		SET created_at = clock_timestamp() - interval '3 seconds',
+		    queued_at = clock_timestamp() - interval '2 seconds'
+		WHERE id = $1::uuid
+	`, taskID)
+	if err != nil {
+		t.Fatalf("set known queue entry time: %v", err)
+	}
 	claimed, err := database.store.ClaimNext(context.Background(), worker.ID, 2*time.Second)
 	if err != nil {
 		t.Fatalf("claim task: %v", err)
 	}
 	if claimed == nil || claimed.ID != taskID || claimed.AttemptNumber != 1 {
 		t.Fatalf("unexpected claim: %#v", claimed)
+	}
+	queueWait := claimed.StartedAt.Sub(claimed.QueuedAt)
+	if queueWait < 1900*time.Millisecond || queueWait > 3*time.Second {
+		t.Fatalf("queue wait=%s does not reflect queued_at", queueWait)
 	}
 
 	var status, owner string

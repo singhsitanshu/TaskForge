@@ -13,10 +13,21 @@ type RetryPromotionStore interface {
 	PromoteDueRetries(context.Context, int) ([]domain.PromotedTask, error)
 }
 
+type RetryPromotionMetrics interface {
+	RetryBatch(time.Duration, error)
+	RetryPromoted(time.Duration)
+}
+
+type noopRetryPromotionMetrics struct{}
+
+func (noopRetryPromotionMetrics) RetryBatch(time.Duration, error) {}
+func (noopRetryPromotionMetrics) RetryPromoted(time.Duration)     {}
+
 type RetryPromotion struct {
-	store  RetryPromotionStore
-	config config.RetryPromotion
-	logger *slog.Logger
+	store   RetryPromotionStore
+	config  config.RetryPromotion
+	logger  *slog.Logger
+	metrics RetryPromotionMetrics
 }
 
 func NewRetryPromotion(
@@ -24,7 +35,18 @@ func NewRetryPromotion(
 	configuration config.RetryPromotion,
 	logger *slog.Logger,
 ) *RetryPromotion {
-	return &RetryPromotion{store: store, config: configuration, logger: logger}
+	return NewObservedRetryPromotion(store, configuration, logger, noopRetryPromotionMetrics{})
+}
+
+func NewObservedRetryPromotion(
+	store RetryPromotionStore,
+	configuration config.RetryPromotion,
+	logger *slog.Logger,
+	metrics RetryPromotionMetrics,
+) *RetryPromotion {
+	return &RetryPromotion{
+		store: store, config: configuration, logger: logger, metrics: metrics,
+	}
 }
 
 func (promotion *RetryPromotion) Run(ctx context.Context) {
@@ -42,12 +64,14 @@ func (promotion *RetryPromotion) Run(ctx context.Context) {
 }
 
 func (promotion *RetryPromotion) scan(ctx context.Context) {
+	started := time.Now()
 	operationContext, cancel := context.WithTimeout(ctx, promotion.config.DBTimeout)
 	defer cancel()
 	promoted, err := promotion.store.PromoteDueRetries(
 		operationContext,
 		promotion.config.BatchSize,
 	)
+	promotion.metrics.RetryBatch(time.Since(started), err)
 	if err != nil {
 		if ctx.Err() == nil {
 			promotion.logger.Error(
@@ -63,6 +87,7 @@ func (promotion *RetryPromotion) scan(ctx context.Context) {
 		return
 	}
 	for _, task := range promoted {
+		promotion.metrics.RetryPromoted(task.Lateness)
 		promotion.logger.Info(
 			"due retry promoted",
 			"event", "task_retry_promoted",

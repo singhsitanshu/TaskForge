@@ -36,7 +36,7 @@ class ApiMetrics:
         )
         self.task_total_latency = Histogram(
             "taskforge_task_total_latency_seconds",
-            "Task creation-to-terminal latency observed by the API.",
+            "Task creation-to-terminal latency.",
             buckets=TASK_LATENCY_BUCKETS,
             registry=self.registry,
         )

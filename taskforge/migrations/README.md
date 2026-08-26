@@ -16,6 +16,8 @@ TaskForge uses paired, ordered PostgreSQL migration files:
 - `000006_task_retries.down.sql` removes that index.
 - `000007_submission_idempotency.up.sql` adds request fingerprints and globally unique durable submission keys.
 - `000007_submission_idempotency.down.sql` removes fingerprint metadata and restores the earlier queue-scoped key index.
+- `000008_observability_queue_time.up.sql` adds and backfills `tasks.queued_at` for exact latest-queue-entry latency measurement.
+- `000008_observability_queue_time.down.sql` removes the queue-entry timestamp and its ordering constraint.
 
 Apply or roll back the current migration against the Compose PostgreSQL service:
 

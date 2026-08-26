@@ -19,6 +19,15 @@ func TestRetryPromotionDueBoundaryAndNoAttemptCreation(t *testing.T) {
 	database := newTestDatabase(t)
 	dueID := insertRetryingTask(t, database, 1, 0)
 	futureID := insertRetryingTask(t, database, 1, time.Minute)
+	var dueQueuedBefore time.Time
+	if err := database.pool.QueryRow(
+		context.Background(),
+		"SELECT queued_at FROM tasks WHERE id = $1::uuid",
+		dueID,
+	).Scan(&dueQueuedBefore); err != nil {
+		t.Fatalf("read pre-promotion queued_at: %v", err)
+	}
+	time.Sleep(time.Millisecond)
 
 	promoted, err := database.store.PromoteDueRetries(context.Background(), 100)
 	if err != nil {
@@ -27,15 +36,26 @@ func TestRetryPromotionDueBoundaryAndNoAttemptCreation(t *testing.T) {
 	if len(promoted) != 1 || promoted[0].TaskID != dueID || promoted[0].AttemptNumber != 1 {
 		t.Fatalf("unexpected promoted retries: %+v", promoted)
 	}
+	if promoted[0].Lateness < 0 || promoted[0].Lateness > 5*time.Second {
+		t.Fatalf("unexpected database retry lateness: %s", promoted[0].Lateness)
+	}
 	var dueStatus, futureStatus string
 	var dueAttempts, futureAttempts int
+	var dueQueuedAfter time.Time
 	err = database.pool.QueryRow(context.Background(), `
 		SELECT
 			(SELECT status::text FROM tasks WHERE id = $1::uuid),
 			(SELECT count(*) FROM task_attempts WHERE task_id = $1::uuid),
 			(SELECT status::text FROM tasks WHERE id = $2::uuid),
-			(SELECT count(*) FROM task_attempts WHERE task_id = $2::uuid)
-	`, dueID, futureID).Scan(&dueStatus, &dueAttempts, &futureStatus, &futureAttempts)
+			(SELECT count(*) FROM task_attempts WHERE task_id = $2::uuid),
+			(SELECT queued_at FROM tasks WHERE id = $1::uuid)
+	`, dueID, futureID).Scan(
+		&dueStatus,
+		&dueAttempts,
+		&futureStatus,
+		&futureAttempts,
+		&dueQueuedAfter,
+	)
 	if err != nil {
 		t.Fatalf("read promotion states: %v", err)
 	}
@@ -44,6 +64,9 @@ func TestRetryPromotionDueBoundaryAndNoAttemptCreation(t *testing.T) {
 			"due=%s/%d future=%s/%d",
 			dueStatus, dueAttempts, futureStatus, futureAttempts,
 		)
+	}
+	if !dueQueuedAfter.After(dueQueuedBefore) {
+		t.Fatalf("queued_at was not reset: before=%s after=%s", dueQueuedBefore, dueQueuedAfter)
 	}
 }
 

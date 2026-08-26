@@ -16,7 +16,7 @@ FastAPI is the public control-plane boundary. It validates submissions, canonica
 
 ### Scheduler (`scheduler`)
 
-The Go scheduler owns two independent lifecycle-maintenance loops:
+The Go scheduler owns two independent lifecycle-maintenance loops and one observability sampler:
 
     Scheduler
     |-- Recovery Loop
@@ -28,10 +28,12 @@ The Go scheduler owns two independent lifecycle-maintenance loops:
         |-- find due RETRYING tasks
         |-- lock with FOR UPDATE SKIP LOCKED
         `-- promote to QUEUED without creating attempts
+    `-- Metrics Collector
+        `-- sample aggregate task, attempt, lease, and worker state
 
 Each scan has its own bounded batch, ticker, and database timeout. Any scheduler replica may run both; PostgreSQL row locking coordinates replicas without leader election. Recovery uses task leases, while retry promotion uses `scheduled_at`. Worker liveness affects neither.
 
-The scheduler exposes only the internal operational `/healthz` endpoint. Schedule evaluation and Redis publication are future responsibilities.
+The scheduler exposes internal `/healthz`, `/readyz`, and `/metrics` endpoints. Schedule evaluation and Redis publication are future responsibilities.
 
 ### Worker (`worker`)
 
@@ -70,9 +72,11 @@ Redis is provisioned for future transient dispatch and coordination. It is not o
                                                        |                |
                                                     Worker          Scheduler
 
+    API / Worker / Scheduler --/metrics--> Prometheus --> Grafana
+
     Redis is present but unused.
 
-Containers use Compose internal DNS. API and web development ports are host-published. Worker and scheduler health endpoints remain internal, so replicas do not compete for host ports.
+Containers use Compose internal DNS. API and web development ports are host-published. Worker and scheduler operational endpoints remain internal, so replicas do not compete for host ports. Prometheus discovers every worker and scheduler replica through Compose DNS.
 
 ## Scheduler concurrency and failure model
 
@@ -88,7 +92,7 @@ Attempt abandonment and task requeue/failure are in one transaction. Retry promo
 - API, scheduler, and worker start after PostgreSQL is healthy.
 - Web starts after API is healthy.
 
-HTTP health reports process availability. Worker `ACTIVE`/`STALE`/`DEAD` is separately derived from durable heartbeats.
+HTTP `/healthz` reports process availability. API, worker, and scheduler `/readyz` perform bounded PostgreSQL checks without making transient dependency failure a liveness failure. Worker `ACTIVE`/`STALE`/`DEAD` is separately derived from durable heartbeats.
 
 ## Ownership rules
 
@@ -100,7 +104,9 @@ HTTP health reports process availability. Worker `ACTIVE`/`STALE`/`DEAD` is sepa
 
 ## Observability
 
-Services log to standard output. Retry scheduling, exhaustion, promotion, recovery, and invariant errors use structured event fields. Empty scheduler scans are DEBUG-only. Metrics, dashboards, and alerting are intentionally deferred.
+Services log to standard output and expose private-registry Prometheus metrics. Retry scheduling, exhaustion, promotion, recovery, and invariant errors use structured event fields that correspond to event counters. Empty scheduler scans are DEBUG-only.
+
+Global gauges are eventually consistent PostgreSQL samples emitted by every scheduler. Dashboards use `max` across replicas, not `sum`. API/worker/scheduler event counters and histograms are process-owned and summed across replicas. `queued_at` records the most recent entry into `QUEUED`, allowing exact queue-wait measurement without changing `scheduled_at` semantics. See `docs/tf-011.md` for the full metric and cardinality contract.
 
 Keyed submission events log the task ID, fingerprint prefix, and a truncated SHA-256 key hash. Arbitrary keys and payloads are not logged for idempotency correlation.
 
@@ -115,7 +121,7 @@ Submission idempotency guarantees one durable logical task for a valid key, not 
     worker/       Go execution service
     web/          React/TypeScript frontend
     migrations/   PostgreSQL migrations
-    monitoring/   Future metrics and dashboards
+    monitoring/   Prometheus configuration and provisioned Grafana dashboard
     tests/        Cross-service and integration tests
     scripts/      Developer and operational scripts
     docs/         Architecture and contract documentation
