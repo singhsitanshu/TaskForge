@@ -85,6 +85,78 @@ func TestRetryableFailureSchedulesWithoutCreatingAttempt(t *testing.T) {
 	}
 }
 
+func TestRetryAttemptsKeepIndependentQueueEntryTimestamps(t *testing.T) {
+	database := newTestDatabase(t)
+	worker := registerWorkers(t, database, 1)[0]
+	ctx := context.Background()
+	taskID := insertTask(t, database, 0, time.Time{}, "")
+	if _, err := database.pool.Exec(ctx, `
+		UPDATE tasks
+		SET created_at = clock_timestamp() - interval '3 seconds',
+		    queued_at = clock_timestamp() - interval '2 seconds'
+		WHERE id = $1::uuid
+	`, taskID); err != nil {
+		t.Fatalf("set first queue entry: %v", err)
+	}
+
+	first, err := database.store.ClaimNext(ctx, worker.ID, time.Second)
+	if err != nil || first == nil {
+		t.Fatalf("claim first attempt: task=%v error=%v", first, err)
+	}
+	var firstQueueBefore time.Time
+	if err := database.pool.QueryRow(ctx, `
+		SELECT queue_entered_at
+		FROM task_attempts
+		WHERE id = $1::uuid
+	`, first.AttemptID).Scan(&firstQueueBefore); err != nil {
+		t.Fatalf("read first queue evidence: %v", err)
+	}
+	if _, err := database.store.RetryableFail(
+		ctx, worker.ID, first, errors.New("retry once"), time.Millisecond,
+	); err != nil {
+		t.Fatalf("schedule retry: %v", err)
+	}
+	if _, err := database.pool.Exec(ctx, `
+		UPDATE tasks
+		SET status = 'QUEUED',
+		    queued_at = clock_timestamp(),
+		    scheduled_at = clock_timestamp()
+		WHERE id = $1::uuid AND status = 'RETRYING'
+	`, taskID); err != nil {
+		t.Fatalf("promote retry fixture: %v", err)
+	}
+
+	second, err := database.store.ClaimNext(ctx, worker.ID, time.Second)
+	if err != nil || second == nil || second.AttemptNumber != 2 {
+		t.Fatalf("claim second attempt: task=%v error=%v", second, err)
+	}
+	var firstQueueAfter, secondQueue, firstStart, secondStart time.Time
+	if err := database.pool.QueryRow(ctx, `
+		SELECT
+			max(queue_entered_at) FILTER (WHERE attempt_number = 1),
+			max(queue_entered_at) FILTER (WHERE attempt_number = 2),
+			max(started_at) FILTER (WHERE attempt_number = 1),
+			max(started_at) FILTER (WHERE attempt_number = 2)
+		FROM task_attempts
+		WHERE task_id = $1::uuid
+	`, taskID).Scan(&firstQueueAfter, &secondQueue, &firstStart, &secondStart); err != nil {
+		t.Fatalf("read retry queue evidence: %v", err)
+	}
+	if !firstQueueAfter.Equal(firstQueueBefore) {
+		t.Fatalf("first queue entry mutated: before=%s after=%s", firstQueueBefore, firstQueueAfter)
+	}
+	if firstStart.Before(firstQueueAfter) || secondStart.Before(secondQueue) {
+		t.Fatalf(
+			"negative queue wait: first=%s second=%s",
+			firstStart.Sub(firstQueueAfter),
+			secondStart.Sub(secondQueue),
+		)
+	}
+	if !secondQueue.After(firstQueueAfter) {
+		t.Fatalf("retry queue entry did not advance: first=%s second=%s", firstQueueAfter, secondQueue)
+	}
+}
+
 func TestRetryableFailureExhaustionAndStaleOwner(t *testing.T) {
 	database := newTestDatabase(t)
 	workers := registerWorkers(t, database, 2)

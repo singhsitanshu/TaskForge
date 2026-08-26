@@ -48,6 +48,7 @@ type ClaimedTask struct {
 	LeaseExpiresAt time.Time
 	CreatedAt      time.Time
 	QueuedAt       time.Time
+	ScheduledAt    time.Time
 	StartedAt      time.Time
 	CompletedAt    time.Time
 	Type           string

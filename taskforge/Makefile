@@ -1,4 +1,4 @@
-.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability
+.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
 
 build:
 	docker compose build
@@ -33,18 +33,21 @@ metrics:
 
 lint:
 	cd api && python -m ruff check .
+	python -m ruff check benchmarks
 	cd scheduler && go vet ./...
 	cd worker && go vet ./...
 	cd web && npm run lint
 
 format:
 	cd api && python -m ruff check --fix . && python -m ruff format .
+	python -m ruff check --fix benchmarks && python -m ruff format benchmarks
 	cd scheduler && gofmt -w $$(find . -type f -name '*.go')
 	cd worker && gofmt -w $$(find . -type f -name '*.go')
 	cd web && npm run format
 
 format-check:
 	cd api && python -m ruff format --check .
+	python -m ruff format --check benchmarks
 	@files=$$(find scheduler worker -type f -name '*.go' -exec gofmt -l {} +); test -z "$$files" || (printf '%s\n' "$$files" && exit 1)
 	cd web && npm run format:check
 
@@ -99,3 +102,44 @@ test-leases:
 test-observability:
 	docker compose --profile test run --rm --build integration-tests pytest -q api/tests/test_metrics.py tests/test_monitoring_config.py tests/test_task_api.py tests/test_worker_e2e.py
 	docker compose --profile test run --rm --build recovery-tests go test -race -v -count=1 ./internal/metrics ./internal/service ./internal/repository -run 'Metrics|Collector|Snapshot|Recovery|RetryPromotion'
+
+benchmark-reset:
+	python3 benchmarks/run.py reset --profile ci
+
+benchmark-smoke:
+	python3 -m benchmarks.trusted --profile trust-smoke --project taskforge-tf012-trust-smoke
+
+benchmark-trust-smoke: benchmark-smoke
+
+benchmark-release:
+	python3 -m benchmarks.trusted --profile release --project taskforge-tf012-release
+
+benchmark-dev:
+	@printf 'UNPUBLISHABLE development run: legacy schema and no trust verdict\n'
+	python3 benchmarks/run.py all --profile baseline
+
+benchmark-scaling:
+	@printf 'UNPUBLISHABLE development run\n'
+	python3 benchmarks/run.py scaling --profile baseline
+
+benchmark-api:
+	@printf 'UNPUBLISHABLE development run\n'
+	python3 benchmarks/run.py api --profile baseline
+
+benchmark-retry:
+	@printf 'UNPUBLISHABLE development run\n'
+	python3 benchmarks/run.py retry --profile baseline
+
+benchmark-recovery:
+	@printf 'UNPUBLISHABLE development run\n'
+	python3 benchmarks/run.py recovery --profile baseline
+
+benchmark-all: benchmark-release
+
+benchmark-plots:
+	@test -n "$(RESULTS)" || (printf 'usage: make benchmark-plots RESULTS=benchmarks/results/<timestamp>/results.json\n' && exit 2)
+	python3 benchmarks/plot.py "$(RESULTS)"
+
+benchmark-report:
+	@test -n "$(RESULTS)" || (printf 'usage: make benchmark-report RESULTS=benchmarks/results/<timestamp>/results.json\n' && exit 2)
+	python3 benchmarks/report.py "$(RESULTS)"

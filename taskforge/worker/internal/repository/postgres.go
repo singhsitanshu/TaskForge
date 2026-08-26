@@ -91,7 +91,8 @@ func (r *Postgres) ClaimNext(
 			candidate.payload,
 			(candidate.attempt_count + 1)::smallint,
 			candidate.created_at,
-			candidate.queued_at
+			candidate.queued_at,
+			candidate.scheduled_at
 		FROM tasks AS candidate
 		WHERE candidate.status = 'QUEUED'
 		  AND candidate.scheduled_at <= clock_timestamp()
@@ -112,6 +113,7 @@ func (r *Postgres) ClaimNext(
 		&task.AttemptNumber,
 		&task.CreatedAt,
 		&task.QueuedAt,
+		&task.ScheduledAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -147,9 +149,15 @@ func (r *Postgres) ClaimNext(
 			worker_id,
 			attempt_number,
 			status,
-			started_at
+			leased_at,
+			started_at,
+			queue_entered_at,
+			scheduled_at_snapshot
 		)
-		VALUES ($1::uuid, $2::uuid, $3, 'RUNNING', clock_timestamp())
+		SELECT $1::uuid, $2::uuid, $3, 'RUNNING', attempt_clock.now, attempt_clock.now, $4, $5
+		FROM (
+			SELECT GREATEST(clock_timestamp(), transaction_timestamp()) AS now
+		) AS attempt_clock
 		RETURNING id::text, started_at
 	`
 	if err := tx.QueryRow(
@@ -158,6 +166,8 @@ func (r *Postgres) ClaimNext(
 		task.ID,
 		workerID,
 		task.AttemptNumber,
+		task.QueuedAt,
+		task.ScheduledAt,
 	).Scan(&task.AttemptID, &task.StartedAt); err != nil {
 		return nil, fmt.Errorf("create task attempt: %w", err)
 	}
@@ -180,7 +190,10 @@ func (r *Postgres) RenewLease(
 			SELECT clock_timestamp() AS now
 		)
 		UPDATE tasks
-		SET lease_expires_at = lease_clock.now + $4 * interval '1 microsecond'
+		SET lease_expires_at = GREATEST(
+			tasks.lease_expires_at,
+			lease_clock.now + $4 * interval '1 microsecond'
+		)
 		FROM lease_clock
 		WHERE tasks.id = $1::uuid
 		  AND tasks.status = 'RUNNING'
@@ -264,7 +277,7 @@ func (r *Postgres) RetryableFail(
 		UPDATE task_attempts
 		SET
 			status = 'FAILED',
-			finished_at = clock_timestamp(),
+			finished_at = GREATEST(clock_timestamp(), leased_at, started_at),
 			output = NULL,
 			error = $5
 		WHERE id = $1::uuid
@@ -313,6 +326,18 @@ func (r *Postgres) RetryableFail(
 			}
 			return domain.RetryOutcome{}, fmt.Errorf("schedule task retry: %w", err)
 		}
+		commandTag, err := tx.Exec(ctx, `
+			UPDATE task_attempts
+			SET retry_scheduled_at = $2
+			WHERE id = $1::uuid
+			  AND status = 'FAILED'
+		`, task.AttemptID, outcome.RetryAt)
+		if err != nil {
+			return domain.RetryOutcome{}, fmt.Errorf("record retry timing evidence: %w", err)
+		}
+		if commandTag.RowsAffected() != 1 {
+			return domain.RetryOutcome{}, domain.ErrLeaseLost
+		}
 	} else {
 		outcome.Exhausted = true
 		const exhaustRetry = `
@@ -321,7 +346,7 @@ func (r *Postgres) RetryableFail(
 				status = 'FAILED',
 				claimed_by_worker_id = NULL,
 				lease_expires_at = NULL,
-				completed_at = clock_timestamp(),
+				completed_at = GREATEST(clock_timestamp(), created_at),
 				result = NULL,
 				last_error = $4,
 				scheduled_at = clock_timestamp()
@@ -444,7 +469,7 @@ func completeSuccess(
 			UPDATE tasks
 			SET
 				status = 'SUCCEEDED',
-				completed_at = clock_timestamp(),
+				completed_at = GREATEST(clock_timestamp(), created_at),
 				result = $4::jsonb,
 				last_error = NULL,
 				claimed_by_worker_id = NULL,
@@ -474,7 +499,7 @@ func completeSuccess(
 			UPDATE task_attempts
 			SET
 				status = 'SUCCEEDED',
-				finished_at = clock_timestamp(),
+				finished_at = GREATEST(clock_timestamp(), leased_at, started_at),
 				output = $5::jsonb,
 				error = NULL
 			WHERE id = $1::uuid
@@ -511,7 +536,7 @@ func completeFailure(
 			UPDATE tasks
 			SET
 				status = 'FAILED',
-				completed_at = clock_timestamp(),
+				completed_at = GREATEST(clock_timestamp(), created_at),
 				result = NULL,
 				last_error = $4,
 				claimed_by_worker_id = NULL,
@@ -541,7 +566,7 @@ func completeFailure(
 			UPDATE task_attempts
 			SET
 				status = 'FAILED',
-				finished_at = clock_timestamp(),
+				finished_at = GREATEST(clock_timestamp(), leased_at, started_at),
 				output = NULL,
 				error = $5
 			WHERE id = $1::uuid

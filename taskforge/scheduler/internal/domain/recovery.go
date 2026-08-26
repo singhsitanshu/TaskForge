@@ -19,6 +19,7 @@ type RecoveredTask struct {
 	OldWorkerID    string
 	AttemptNumber  int16
 	LeaseExpiresAt time.Time
+	RecoveredAt    time.Time
 	RecoveryLag    time.Duration
 	Action         RecoveryAction
 	TotalLatency   time.Duration

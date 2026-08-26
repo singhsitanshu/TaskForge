@@ -22,6 +22,7 @@ type expiredTask struct {
 	attemptNumber    int16
 	maxAttempts      int16
 	leaseExpiresAt   time.Time
+	recoveredAt      time.Time
 	recoveryLagNanos int64
 }
 
@@ -235,12 +236,12 @@ func (repository *Postgres) RecoverExpired(
 			continue
 		}
 
-		if err := abandonAttempt(ctx, tx, task, attempt); err != nil {
-			return domain.RecoveryBatch{}, err
-		}
 		action := domain.RecoveryRequeued
 		if task.attemptNumber >= task.maxAttempts {
 			action = domain.RecoveryFailed
+		}
+		if err := abandonAttempt(ctx, tx, task, attempt, action); err != nil {
+			return domain.RecoveryBatch{}, err
 		}
 		totalLatency, err := transitionTask(ctx, tx, task, action)
 		if err != nil {
@@ -251,6 +252,7 @@ func (repository *Postgres) RecoverExpired(
 			OldWorkerID:    task.workerID,
 			AttemptNumber:  task.attemptNumber,
 			LeaseExpiresAt: task.leaseExpiresAt,
+			RecoveredAt:    task.recoveredAt,
 			RecoveryLag:    time.Duration(task.recoveryLagNanos),
 			Action:         action,
 			TotalLatency:   totalLatency,
@@ -265,18 +267,23 @@ func (repository *Postgres) RecoverExpired(
 
 func lockExpiredTasks(ctx context.Context, tx pgx.Tx, batchSize int) ([]expiredTask, error) {
 	const query = `
+		WITH recovery_clock AS (
+			SELECT clock_timestamp() AS now
+		)
 		SELECT
 			task.id::text,
 			task.claimed_by_worker_id::text,
 			task.attempt_count,
 			task.max_attempts,
 			task.lease_expires_at,
-			(EXTRACT(EPOCH FROM (clock_timestamp() - task.lease_expires_at)) * 1000000000)::bigint
+			recovery_clock.now,
+			(EXTRACT(EPOCH FROM (recovery_clock.now - task.lease_expires_at)) * 1000000000)::bigint
 		FROM tasks AS task
+		CROSS JOIN recovery_clock
 		WHERE task.status = 'RUNNING'
 		  AND task.lease_expires_at <= clock_timestamp()
 		ORDER BY task.lease_expires_at ASC
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE OF task SKIP LOCKED
 		LIMIT $1
 	`
 	rows, err := tx.Query(ctx, query, batchSize)
@@ -294,6 +301,7 @@ func lockExpiredTasks(ctx context.Context, tx pgx.Tx, batchSize int) ([]expiredT
 			&task.attemptNumber,
 			&task.maxAttempts,
 			&task.leaseExpiresAt,
+			&task.recoveredAt,
 			&task.recoveryLagNanos,
 		); err != nil {
 			return nil, fmt.Errorf("scan expired task: %w", err)
@@ -338,14 +346,18 @@ func abandonAttempt(
 	tx pgx.Tx,
 	task expiredTask,
 	attempt activeAttempt,
+	action domain.RecoveryAction,
 ) error {
 	const query = `
 		UPDATE task_attempts
 		SET
 			status = 'ABANDONED',
-			finished_at = clock_timestamp(),
+			finished_at = GREATEST(clock_timestamp(), leased_at, started_at),
 			output = NULL,
-			error = $5
+			error = $5,
+			recovered_lease_expires_at = $6,
+			recovered_at = $7,
+			recovery_action = $8
 		WHERE id = $1::uuid
 		  AND task_id = $2::uuid
 		  AND worker_id = $3::uuid
@@ -360,6 +372,9 @@ func abandonAttempt(
 		task.workerID,
 		task.attemptNumber,
 		domain.AttemptAbandonReason,
+		task.leaseExpiresAt,
+		task.recoveredAt,
+		action,
 	)
 	if err != nil {
 		return fmt.Errorf("abandon attempt for task %s: %w", task.id, err)
@@ -382,14 +397,14 @@ func transitionTask(
 	if action == domain.RecoveryFailed {
 		status = "FAILED"
 		lastError = domain.MaxAttemptsExpiredError
-		completionExpression = "clock_timestamp()"
+		completionExpression = "GREATEST(clock_timestamp(), created_at)"
 	}
 	query := fmt.Sprintf(`
 		UPDATE tasks
 		SET
 			status = $5::task_status,
 			queued_at = CASE
-				WHEN $5::task_status = 'QUEUED' THEN clock_timestamp()
+				WHEN $5::task_status = 'QUEUED' THEN $7
 				ELSE queued_at
 			END,
 			claimed_by_worker_id = NULL,
@@ -415,6 +430,7 @@ func transitionTask(
 		task.leaseExpiresAt,
 		status,
 		lastError,
+		task.recoveredAt,
 	).Scan(&totalLatencySeconds)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

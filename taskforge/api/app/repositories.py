@@ -181,8 +181,8 @@ class PostgresTaskRepository:
             UPDATE tasks
             SET
                 status = 'CANCELLED',
-                completed_at = statement_timestamp(),
-                scheduled_at = statement_timestamp()
+                completed_at = GREATEST(statement_timestamp(), created_at),
+                scheduled_at = GREATEST(statement_timestamp(), created_at)
             WHERE id = %s
               AND status IN ('QUEUED', 'RETRYING')
             RETURNING {_TASK_COLUMNS}

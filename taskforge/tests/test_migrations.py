@@ -83,7 +83,42 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 "000006_task_retries",
                 "000007_submission_idempotency",
                 "000008_observability_queue_time",
+                "000009_monotonic_timestamps",
+                "000010_attempt_timing_evidence",
             ]
+
+            attempt_evidence_columns = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name = 'task_attempts'
+                    """,
+                    (schema_name,),
+                )
+            }
+            assert {
+                "queue_entered_at",
+                "scheduled_at_snapshot",
+                "retry_scheduled_at",
+                "recovered_lease_expires_at",
+                "recovered_at",
+                "recovery_action",
+            } <= attempt_evidence_columns
+
+            update_trigger_source = fetch_scalar(
+                connection,
+                """
+                SELECT prosrc
+                FROM pg_proc
+                WHERE oid = 'set_updated_at()'::regprocedure
+                """,
+            )
+            assert "GREATEST(clock_timestamp(), OLD.updated_at, NEW.created_at)" in (
+                update_trigger_source
+            )
 
             statuses = [
                 row[0]
@@ -226,6 +261,17 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 """,
                 (task_id, worker_id),
             )
+
+            with pytest.raises(errors.CheckViolation):
+                connection.execute(
+                    """
+                    UPDATE task_attempts
+                    SET queue_entered_at = clock_timestamp() + interval '1 second',
+                        started_at = clock_timestamp()
+                    WHERE task_id = %s AND attempt_number = 1
+                    """,
+                    (task_id,),
+                )
 
             abandoned_task_id = fetch_scalar(
                 connection,

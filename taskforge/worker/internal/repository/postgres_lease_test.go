@@ -119,6 +119,48 @@ func TestLeaseRenewalOwnershipAndTerminalRules(t *testing.T) {
 	}
 }
 
+func TestCompletionClampsTimestampAgainstBackwardWallClock(t *testing.T) {
+	database := newTestDatabase(t)
+	worker := registerWorkers(t, database, 1)[0]
+	ctx := context.Background()
+	insertTask(t, database, 0, time.Time{}, "")
+	claimed, err := database.store.ClaimNext(ctx, worker.ID, 5*time.Second)
+	if err != nil {
+		t.Fatalf("claim task: %v", err)
+	}
+
+	_, err = database.pool.Exec(ctx, `
+		UPDATE task_attempts
+		SET leased_at = clock_timestamp() + interval '100 milliseconds',
+		    started_at = clock_timestamp() + interval '100 milliseconds'
+		WHERE id = $1::uuid
+	`, claimed.AttemptID)
+	if err != nil {
+		t.Fatalf("simulate backward wall clock: %v", err)
+	}
+	if err := database.store.Complete(
+		ctx,
+		worker.ID,
+		claimed,
+		map[string]any{"ok": true},
+		nil,
+	); err != nil {
+		t.Fatalf("complete across backward wall clock: %v", err)
+	}
+
+	var ordered bool
+	if err := database.pool.QueryRow(ctx, `
+		SELECT finished_at >= started_at AND updated_at >= created_at
+		FROM task_attempts
+		WHERE id = $1::uuid
+	`, claimed.AttemptID).Scan(&ordered); err != nil {
+		t.Fatalf("read clamped attempt timestamps: %v", err)
+	}
+	if !ordered {
+		t.Fatal("completion timestamps were not clamped")
+	}
+}
+
 func TestExpiredLeaseAndStaleAttemptCannotComplete(t *testing.T) {
 	database := newTestDatabase(t)
 	workers := registerWorkers(t, database, 2)
@@ -179,6 +221,13 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 	if err != nil || oldClaim == nil {
 		t.Fatalf("claim old attempt: task=%v error=%v", oldClaim, err)
 	}
+	if _, err := database.pool.Exec(ctx, `
+		UPDATE tasks
+		SET lease_expires_at = clock_timestamp() - interval '1 millisecond'
+		WHERE id = $1::uuid
+	`, oldClaim.ID); err != nil {
+		t.Fatalf("expire recovery fixture lease: %v", err)
+	}
 
 	tx, err := database.pool.Begin(ctx)
 	if err != nil {
@@ -186,9 +235,14 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE task_attempts
-		SET status = 'ABANDONED', finished_at = clock_timestamp(), error = 'lease_expired'
+		SET status = 'ABANDONED',
+		    finished_at = clock_timestamp(),
+		    error = 'lease_expired',
+		    recovered_lease_expires_at = (SELECT lease_expires_at FROM tasks WHERE id = $2::uuid),
+		    recovered_at = clock_timestamp(),
+		    recovery_action = 'requeued'
 		WHERE id = $1::uuid AND status = 'RUNNING'
-	`, oldClaim.AttemptID); err != nil {
+	`, oldClaim.AttemptID, oldClaim.ID); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("abandon old attempt: %v", err)
 	}
@@ -196,6 +250,7 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 		UPDATE tasks
 		SET
 			status = 'QUEUED',
+			queued_at = clock_timestamp(),
 			claimed_by_worker_id = NULL,
 			lease_expires_at = NULL,
 			last_error = 'lease_expired'
@@ -254,7 +309,8 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 	}
 
 	rows, err := database.pool.Query(ctx, `
-		SELECT attempt_number, worker_id::text, status::text, error
+		SELECT attempt_number, worker_id::text, status::text, error,
+		       queue_entered_at, started_at
 		FROM task_attempts
 		WHERE task_id = $1::uuid
 		ORDER BY attempt_number
@@ -264,15 +320,24 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 	}
 	defer rows.Close()
 	type attemptState struct {
-		number   int
-		workerID string
-		status   string
-		error    *string
+		number    int
+		workerID  string
+		status    string
+		error     *string
+		queuedAt  time.Time
+		startedAt time.Time
 	}
 	attempts := make([]attemptState, 0, 2)
 	for rows.Next() {
 		var attempt attemptState
-		if err := rows.Scan(&attempt.number, &attempt.workerID, &attempt.status, &attempt.error); err != nil {
+		if err := rows.Scan(
+			&attempt.number,
+			&attempt.workerID,
+			&attempt.status,
+			&attempt.error,
+			&attempt.queuedAt,
+			&attempt.startedAt,
+		); err != nil {
 			t.Fatalf("scan recovered history: %v", err)
 		}
 		attempts = append(attempts, attempt)
@@ -281,6 +346,11 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 		attempts[0].number != 1 || attempts[0].workerID != workers[0].ID || attempts[0].status != "ABANDONED" ||
 		attempts[1].number != 2 || attempts[1].workerID != workers[1].ID || attempts[1].status != "SUCCEEDED" {
 		t.Fatalf("unexpected recovered history: %+v", attempts)
+	}
+	if attempts[0].startedAt.Before(attempts[0].queuedAt) ||
+		attempts[1].startedAt.Before(attempts[1].queuedAt) ||
+		!attempts[1].queuedAt.After(attempts[0].queuedAt) {
+		t.Fatalf("invalid immutable recovery queue timing: %+v", attempts)
 	}
 	t.Log("STALE_OWNER renew=rejected complete=rejected fail=rejected next_attempt=2 final=SUCCEEDED")
 }

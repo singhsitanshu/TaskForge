@@ -84,6 +84,24 @@ func TestSingleExpiredTaskRecovery(t *testing.T) {
 	if !queuedAfter.After(queuedBefore) {
 		t.Fatalf("queued_at was not reset: before=%s after=%s", queuedBefore, queuedAfter)
 	}
+	var recoveredLease, recoveredAt time.Time
+	var recoveryAction string
+	if err := database.pool.QueryRow(context.Background(), `
+		SELECT recovered_lease_expires_at, recovered_at, recovery_action
+		FROM task_attempts
+		WHERE task_id = $1::uuid AND attempt_number = 1
+	`, task.id).Scan(&recoveredLease, &recoveredAt, &recoveryAction); err != nil {
+		t.Fatalf("read recovery timing evidence: %v", err)
+	}
+	if !recoveredLease.Equal(task.leaseExpiresAt) || recoveredAt.Before(recoveredLease) ||
+		recoveryAction != "requeued" {
+		t.Fatalf(
+			"invalid recovery evidence: lease=%s recovered=%s action=%s",
+			recoveredLease,
+			recoveredAt,
+			recoveryAction,
+		)
+	}
 
 	second, err := database.store.RecoverExpired(context.Background(), 100)
 	if err != nil || len(second.Recovered) != 0 || len(second.Violations) != 0 {

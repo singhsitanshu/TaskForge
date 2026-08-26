@@ -86,7 +86,7 @@ services:
     environment:
       HTTP_ADDR: :8080
       DATABASE_URL: postgresql://${POSTGRES_USER:-taskforge}:${POSTGRES_PASSWORD:-taskforge}@postgres:5432/${POSTGRES_DB:-taskforge}?sslmode=disable
-      POLL_INTERVAL: 1s
+      POLL_INTERVAL: ${POLL_INTERVAL:-1s}
       WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-5s}
       WORKER_STALE_AFTER: ${WORKER_STALE_AFTER:-15s}
       WORKER_DEAD_AFTER: ${WORKER_DEAD_AFTER:-30s}

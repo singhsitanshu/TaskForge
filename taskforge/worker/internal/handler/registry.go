@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,8 @@ type Registry struct {
 
 func NewRegistry() *Registry {
 	registry := &Registry{handlers: make(map[string]Handler)}
+	registry.Register("test.noop", noop)
+	registry.Register("test.cpu", cpu)
 	registry.Register("test.echo", echo)
 	registry.Register("test.fail", fail)
 	registry.Register("test.fail_terminal", fail)
@@ -30,6 +33,38 @@ func NewRegistry() *Registry {
 	registry.Register("test.mixed_failure", mixedFailure)
 	registry.Register("test.sleep", sleep)
 	return registry
+}
+
+func noop(_ context.Context, _ json.RawMessage, _ domain.ExecutionMetadata) (map[string]any, error) {
+	return map[string]any{"ok": true}, nil
+}
+
+func cpu(ctx context.Context, payload json.RawMessage, _ domain.ExecutionMetadata) (map[string]any, error) {
+	var input struct {
+		Iterations int `json:"iterations"`
+	}
+	if err := json.Unmarshal(payload, &input); err != nil {
+		return nil, fmt.Errorf("decode test.cpu payload: %w", err)
+	}
+	if input.Iterations < 1 || input.Iterations > 10_000_000 {
+		return nil, errors.New("test.cpu iterations must be between 1 and 10000000")
+	}
+
+	digest := sha256.Sum256([]byte("taskforge-benchmark"))
+	for iteration := 0; iteration < input.Iterations; iteration++ {
+		if iteration%4096 == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+		}
+		digest = sha256.Sum256(digest[:])
+	}
+	return map[string]any{
+		"iterations": input.Iterations,
+		"digest":     fmt.Sprintf("%x", digest),
+	}, nil
 }
 
 func (r *Registry) Register(taskType string, handler Handler) {

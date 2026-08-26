@@ -27,6 +27,46 @@ func TestEchoHandler(t *testing.T) {
 	}
 }
 
+func TestNoopHandler(t *testing.T) {
+	result, err := NewRegistry().Execute(
+		context.Background(), "test.noop", json.RawMessage(`{}`), domain.ExecutionMetadata{},
+	)
+	if err != nil {
+		t.Fatalf("execute noop: %v", err)
+	}
+	if result["ok"] != true {
+		t.Fatalf("unexpected noop result: %#v", result)
+	}
+}
+
+func TestDeterministicCPUHandler(t *testing.T) {
+	registry := NewRegistry()
+	first, err := registry.Execute(
+		context.Background(), "test.cpu", json.RawMessage(`{"iterations":10}`), domain.ExecutionMetadata{},
+	)
+	if err != nil {
+		t.Fatalf("execute cpu: %v", err)
+	}
+	second, err := registry.Execute(
+		context.Background(), "test.cpu", json.RawMessage(`{"iterations":10}`), domain.ExecutionMetadata{},
+	)
+	if err != nil {
+		t.Fatalf("execute cpu again: %v", err)
+	}
+	if first["digest"] != second["digest"] || first["iterations"] != 10 {
+		t.Fatalf("cpu result is not deterministic: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestCPUHandlerValidatesIterations(t *testing.T) {
+	_, err := NewRegistry().Execute(
+		context.Background(), "test.cpu", json.RawMessage(`{"iterations":0}`), domain.ExecutionMetadata{},
+	)
+	if err == nil {
+		t.Fatal("expected invalid iterations error")
+	}
+}
+
 func TestFailHandler(t *testing.T) {
 	_, err := NewRegistry().Execute(context.Background(), "test.fail", json.RawMessage("{}"), domain.ExecutionMetadata{})
 	if err == nil || !strings.Contains(err.Error(), "requested failure") {
