@@ -1,6 +1,6 @@
 # TaskForge
 
-TaskForge is a service-oriented task orchestration platform. The current milestone includes task submission, priority-aware PostgreSQL workers, durable worker heartbeats, renewable leases, expired-ownership recovery, and typed application retries with delayed exponential backoff. Recurring schedules, Redis dispatch, and arbitrary task execution are not implemented.
+TaskForge is a service-oriented task orchestration platform. The current milestone includes durable idempotent task submission, priority-aware PostgreSQL workers, durable worker heartbeats, renewable leases, expired-ownership recovery, and typed application retries with delayed exponential backoff. Execution remains at-least-once; submission idempotency does not make arbitrary external side effects exactly-once. Recurring schedules, Redis dispatch, and arbitrary task execution are not implemented.
 
 ## Services
 
@@ -32,8 +32,10 @@ Open the web app at <http://localhost:3000> and the API documentation at <http:/
     make test-heartbeats # Run worker-liveness integration tests
     make test-recovery  # Run scheduler recovery tests with Go race detection
     make test-retries   # Run retry scheduling, promotion, and E2E proofs
+    make test-idempotency # Run submission replay and contention proofs
     make migrate-up    # Apply the PostgreSQL schema
     make migrate-down  # Roll back the PostgreSQL schema
     make down          # Stop the local stack
 
 See [docs/architecture.md](docs/architecture.md) for service boundaries and communication paths.
+See [docs/tf-010.md](docs/tf-010.md) for the idempotent-submission contract and execution guarantee boundary.

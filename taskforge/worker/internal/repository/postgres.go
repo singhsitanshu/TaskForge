@@ -89,7 +89,9 @@ func (r *Postgres) ClaimNext(
 			candidate.id::text,
 			candidate.task_type,
 			candidate.payload,
-			(candidate.attempt_count + 1)::smallint
+			(candidate.attempt_count + 1)::smallint,
+			candidate.created_at,
+			candidate.queued_at
 		FROM tasks AS candidate
 		WHERE candidate.status = 'QUEUED'
 		  AND candidate.scheduled_at <= clock_timestamp()
@@ -108,6 +110,8 @@ func (r *Postgres) ClaimNext(
 		&task.Type,
 		&task.Payload,
 		&task.AttemptNumber,
+		&task.CreatedAt,
+		&task.QueuedAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -146,7 +150,7 @@ func (r *Postgres) ClaimNext(
 			started_at
 		)
 		VALUES ($1::uuid, $2::uuid, $3, 'RUNNING', clock_timestamp())
-		RETURNING id::text
+		RETURNING id::text, started_at
 	`
 	if err := tx.QueryRow(
 		ctx,
@@ -154,7 +158,7 @@ func (r *Postgres) ClaimNext(
 		task.ID,
 		workerID,
 		task.AttemptNumber,
-	).Scan(&task.AttemptID); err != nil {
+	).Scan(&task.AttemptID, &task.StartedAt); err != nil {
 		return nil, fmt.Errorf("create task attempt: %w", err)
 	}
 

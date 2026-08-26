@@ -4,6 +4,7 @@ The Docker-backed suite uses a real PostgreSQL server and temporary schemas:
 
 - `test_migrations.py` verifies schema creation, constraints, indexes, and rollback.
 - `test_task_api.py` exercises task submission, retrieval, listing, cancellation, validation, conflicts, idempotency, and persisted `QUEUED` state through the FastAPI application.
+- `test_idempotency_api.py` proves canonical replay, semantic conflicts, lifecycle independence, keyless behavior, rollback, index use, repeated 100-way duplicate races, and mixed-fingerprint contention against PostgreSQL.
 - `test_worker_e2e.py` starts the compiled Go worker and proves API submission through `SUCCEEDED`, repeated polling, failure reporting, and deterministic priority ordering.
 - `test_claim_races.py` releases API cancellation and the real Go claim transaction together, then verifies only valid serialized states.
 - `test_worker_api.py` verifies worker list/detail liveness using PostgreSQL time.
@@ -28,6 +29,7 @@ Run the scheduler recovery suite with Go race detection:
 
     make test-recovery
     make test-retries
+    make test-idempotency
 
 Run one integration area:
 

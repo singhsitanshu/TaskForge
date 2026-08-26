@@ -2,12 +2,12 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 from uuid import UUID
 
-from psycopg import errors
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from app.domain import (
     NewTask,
+    SubmitTaskResult,
     Task,
     TaskAttempt,
     TaskAttemptStatus,
@@ -25,12 +25,14 @@ _TASK_COLUMNS = """
     max_attempts,
     attempt_count,
     scheduled_at,
+    queued_at,
     claimed_by_worker_id,
     lease_expires_at,
     completed_at,
     result,
     last_error,
     idempotency_key,
+    request_fingerprint,
     created_at,
     updated_at
 """
@@ -51,12 +53,12 @@ _TASK_ATTEMPT_COLUMNS = """
 """
 
 
-class DuplicateTaskError(Exception):
-    pass
-
-
 class TaskRepository(Protocol):
-    async def create(self, new_task: NewTask) -> Task: ...
+    async def submit(
+        self,
+        new_task: NewTask,
+        request_fingerprint: str | None,
+    ) -> SubmitTaskResult: ...
 
     async def get(self, task_id: UUID) -> Task | None: ...
 
@@ -84,7 +86,11 @@ class PostgresTaskRepository:
     def __init__(self, pool: AsyncConnectionPool) -> None:
         self._pool = pool
 
-    async def create(self, new_task: NewTask) -> Task:
+    async def submit(
+        self,
+        new_task: NewTask,
+        request_fingerprint: str | None,
+    ) -> SubmitTaskResult:
         query = f"""
             INSERT INTO tasks (
                 queue,
@@ -94,9 +100,13 @@ class PostgresTaskRepository:
                 priority,
                 max_attempts,
                 scheduled_at,
-                idempotency_key
+                idempotency_key,
+                request_fingerprint
             )
-            VALUES (%s, %s, %s, 'QUEUED', %s, %s, COALESCE(%s, now()), %s)
+            VALUES (%s, %s, %s, 'QUEUED', %s, %s, COALESCE(%s, now()), %s, %s)
+            ON CONFLICT (idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                DO NOTHING
             RETURNING {_TASK_COLUMNS}
         """
         parameters = (
@@ -107,19 +117,24 @@ class PostgresTaskRepository:
             new_task.max_attempts,
             new_task.scheduled_at,
             new_task.idempotency_key,
+            request_fingerprint,
         )
 
-        try:
-            async with self._pool.connection() as connection:
-                cursor = await connection.execute(query, parameters)
-                row = await cursor.fetchone()
-        except errors.UniqueViolation as exc:
-            if exc.diag.constraint_name == "tasks_queue_idempotency_key_idx":
-                raise DuplicateTaskError from exc
-            raise
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(query, parameters)
+            row = await cursor.fetchone()
+            if row is not None:
+                return SubmitTaskResult(task=_task_from_row(row), created=True)
 
-        assert row is not None
-        return _task_from_row(row)
+            assert new_task.idempotency_key is not None
+            cursor = await connection.execute(
+                f"SELECT {_TASK_COLUMNS} FROM tasks WHERE idempotency_key = %s",
+                (new_task.idempotency_key,),
+            )
+            existing = await cursor.fetchone()
+            if existing is None:
+                raise RuntimeError("idempotency conflict winner was not visible")
+            return SubmitTaskResult(task=_task_from_row(existing), created=False)
 
     async def get(self, task_id: UUID) -> Task | None:
         query = f"SELECT {_TASK_COLUMNS} FROM tasks WHERE id = %s"
@@ -201,12 +216,14 @@ def _task_from_row(row: dict[str, Any]) -> Task:
         max_attempts=row["max_attempts"],
         attempt_count=row["attempt_count"],
         scheduled_at=row["scheduled_at"],
+        queued_at=row["queued_at"],
         claimed_by_worker_id=row["claimed_by_worker_id"],
         lease_expires_at=row["lease_expires_at"],
         completed_at=row["completed_at"],
         result=row["result"],
         last_error=row["last_error"],
         idempotency_key=row["idempotency_key"],
+        request_fingerprint=row["request_fingerprint"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

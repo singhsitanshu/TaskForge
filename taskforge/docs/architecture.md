@@ -2,7 +2,7 @@
 
 ## Scope
 
-TaskForge currently provides task submission, predefined Go worker handlers, durable worker heartbeats, renewable task leases, expired-ownership recovery, and typed handler retries with delayed exponential backoff. PostgreSQL is authoritative for every lifecycle transition. Recurring schedule evaluation, Redis dispatch, and arbitrary task execution remain out of scope.
+TaskForge currently provides durable idempotent task submission, predefined Go worker handlers, durable worker heartbeats, renewable task leases, expired-ownership recovery, and typed handler retries with delayed exponential backoff. PostgreSQL is authoritative for submission identity and every lifecycle transition. Recurring schedule evaluation, Redis dispatch, and arbitrary task execution remain out of scope.
 
 ## Service boundaries
 
@@ -12,7 +12,7 @@ The React/TypeScript application is the browser-facing interface. It is built as
 
 ### API (`api`)
 
-FastAPI is the public control-plane boundary. It validates submissions, reads task and ordered attempt history, permits cancellation of unowned `QUEUED` and `RETRYING` work, and derives worker liveness for operators. It does not dispatch or execute work. PostgreSQL is the source of every API response.
+FastAPI is the public control-plane boundary. It validates submissions, canonicalizes their semantic fields, and provides optional `Idempotency-Key` replay. PostgreSQL uniqueness arbitrates concurrent keyed creation; the API maps the winning insert to `201`, matching replays to `200`, and fingerprint conflicts to `409`. It also reads task and ordered attempt history, permits cancellation of unowned `QUEUED` and `RETRYING` work, and derives worker liveness for operators. It does not dispatch or execute work. PostgreSQL is the source of every API response.
 
 ### Scheduler (`scheduler`)
 
@@ -51,7 +51,7 @@ Renewal, completion, and retry scheduling require the same task, worker, attempt
 
 ### PostgreSQL (`postgres`)
 
-PostgreSQL is the durable coordination mechanism and system of record for tasks, attempts, workers, ownership, results, retries, and recovery. Claim, completion, retry failure, promotion, and recovery use atomic database transactions.
+PostgreSQL is the durable coordination mechanism and system of record for tasks, submission keys and fingerprints, attempts, workers, ownership, results, retries, and recovery. Submission, claim, completion, retry failure, promotion, and recovery use atomic database transactions.
 
 ### Redis (`redis`)
 
@@ -101,6 +101,12 @@ HTTP health reports process availability. Worker `ACTIVE`/`STALE`/`DEAD` is sepa
 ## Observability
 
 Services log to standard output. Retry scheduling, exhaustion, promotion, recovery, and invariant errors use structured event fields. Empty scheduler scans are DEBUG-only. Metrics, dashboards, and alerting are intentionally deferred.
+
+Keyed submission events log the task ID, fingerprint prefix, and a truncated SHA-256 key hash. Arbitrary keys and payloads are not logged for idempotency correlation.
+
+## Delivery semantics
+
+Submission idempotency guarantees one durable logical task for a valid key, not exactly-once execution. Lease recovery makes execution at-least-once: an attempt may produce an external side effect before crashing, and a later attempt may repeat it. External side-effect deduplication remains the handler or destination system's responsibility.
 
 ## Repository layout
 

@@ -133,19 +133,25 @@ def test_submit_get_list_and_cancel(
     assert attempts_before == attempts_after == 0
 
 
-def test_idempotency_key_conflict_is_scoped_to_queue(api_client: TestClient) -> None:
+def test_deprecated_body_idempotency_key_replays_globally(
+    api_client: TestClient,
+) -> None:
     payload = {
         "task_type": "report.generate",
         "queue": "reports",
-        "idempotency_key": "report-request-1",
+        "idempotency_key": f"report-request-{uuid.uuid4().hex}",
     }
-    assert api_client.post("/tasks", json=payload).status_code == 201
+    first = api_client.post("/tasks", json=payload)
+    assert first.status_code == 201
 
-    conflict = api_client.post("/tasks", json=payload)
-    assert conflict.status_code == 409
+    replay = api_client.post("/tasks", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["id"] == first.json()["id"]
 
     payload["queue"] = "priority-reports"
-    assert api_client.post("/tasks", json=payload).status_code == 201
+    conflict = api_client.post("/tasks", json=payload)
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSE"
 
 
 @pytest.mark.parametrize("terminal_status", ["FAILED", "SUCCEEDED"])

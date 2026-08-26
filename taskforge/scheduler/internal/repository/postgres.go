@@ -56,7 +56,9 @@ func (repository *Postgres) PromoteDueRetries(
 			LIMIT $1
 		)
 		UPDATE tasks AS task
-		SET status = 'QUEUED'
+		SET
+			status = 'QUEUED',
+			queued_at = clock_timestamp()
 		FROM due
 		WHERE task.id = due.id
 		  AND task.status = 'RETRYING'
@@ -277,6 +279,10 @@ func transitionTask(
 		UPDATE tasks
 		SET
 			status = $5,
+			queued_at = CASE
+				WHEN $5 = 'QUEUED' THEN clock_timestamp()
+				ELSE queued_at
+			END,
 			claimed_by_worker_id = NULL,
 			lease_expires_at = NULL,
 			completed_at = %s,

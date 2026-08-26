@@ -221,19 +221,29 @@ def test_crash_recovery_reclaim_and_success(
     worker_b = None
     scheduler_output = ""
     worker_b_output = ""
+    idempotency_key = f"crash-recovery-{uuid.uuid4().hex}"
+    submission = {
+        "task_type": "test.sleep",
+        "payload": {"duration_ms": 1000},
+        "max_attempts": 3,
+    }
     try:
         worker_a_id = wait_for_worker(schema_name, worker_a_instance, worker_a)
         response = client.post(
             "/tasks",
-            json={
-                "task_type": "test.sleep",
-                "payload": {"duration_ms": 1000},
-                "max_attempts": 3,
-            },
+            headers={"Idempotency-Key": idempotency_key},
+            json=submission,
         )
         assert response.status_code == 201
         task_id = response.json()["id"]
         running = wait_for_task(client, task_id, "RUNNING", worker_a)
+        running_replay = client.post(
+            "/tasks",
+            headers={"Idempotency-Key": idempotency_key},
+            json=submission,
+        )
+        assert running_replay.status_code == 200
+        assert running_replay.json()["id"] == task_id
         initial_lease = running["lease_expires_at"]
 
         deadline = time.monotonic() + 2
@@ -258,6 +268,13 @@ def test_crash_recovery_reclaim_and_success(
         )
         assert abandoned[6] is not None
 
+        queued_replay = client.post(
+            "/tasks",
+            headers={"Idempotency-Key": idempotency_key},
+            json=submission,
+        )
+        assert queued_replay.status_code == 200
+        assert queued_replay.json()["id"] == task_id
         worker_b_instance = f"recovery-worker-b-{uuid.uuid4().hex}"
         worker_b = start_worker(schema_name, worker_b_instance)
         worker_b_id = wait_for_worker(schema_name, worker_b_instance, worker_b)
@@ -276,8 +293,23 @@ def test_crash_recovery_reclaim_and_success(
         assert history[0]["error"] == "lease_expired"
         assert history[1]["worker_id"] == worker_b_id
         assert history[1]["error"] is None
+        final_replay = client.post(
+            "/tasks",
+            headers={"Idempotency-Key": idempotency_key},
+            json=submission,
+        )
+        assert final_replay.status_code == 200
+        assert final_replay.json()["id"] == task_id
+        assert final_replay.json()["status"] == "SUCCEEDED"
+        assert client.get(f"/tasks/{task_id}/attempts").json()["items"] == history
+        with schema_connection(schema_name) as connection:
+            keyed_task_count = connection.execute(
+                "SELECT count(*) FROM tasks WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()[0]
+        assert keyed_task_count == 1
         print(
-            "CRASH_RECOVERY task=SUCCEEDED attempt_count=2 "
+            "CRASH_RECOVERY keyed_tasks=1 task=SUCCEEDED attempt_count=2 "
             "attempt_1=ABANDONED attempt_2=SUCCEEDED"
         )
     finally:
@@ -298,22 +330,65 @@ def test_retry_backoff_then_success(
     schema_name, client = recovery_environment
     scheduler = start_scheduler(schema_name)
     worker_instance = f"retry-success-{uuid.uuid4().hex}"
-    worker = start_worker(schema_name, worker_instance)
+    worker = None
+    idempotency_key = f"retry-success-{uuid.uuid4().hex}"
+    submission = {
+        "task_type": "test.fail_n_then_succeed",
+        "payload": {"failures": 2},
+        "max_attempts": 3,
+    }
     try:
-        wait_for_worker(schema_name, worker_instance, worker)
         response = client.post(
             "/tasks",
-            json={
-                "task_type": "test.fail_n_then_succeed",
-                "payload": {"failures": 2},
-                "max_attempts": 3,
-            },
+            headers={"Idempotency-Key": idempotency_key},
+            json=submission,
         )
         assert response.status_code == 201
         task_id = response.json()["id"]
-        succeeded = wait_for_task(client, task_id, "SUCCEEDED", worker, timeout=8)
+        queued_replay = client.post(
+            "/tasks",
+            headers={"Idempotency-Key": idempotency_key},
+            json=submission,
+        )
+        assert queued_replay.status_code == 200
+        assert queued_replay.json()["id"] == task_id
+        assert queued_replay.json()["status"] == "QUEUED"
+
+        worker = start_worker(schema_name, worker_instance)
+        wait_for_worker(schema_name, worker_instance, worker)
+        retrying_attempts: set[int] = set()
+        deadline = time.monotonic() + 8
+        succeeded = None
+        while time.monotonic() < deadline:
+            assert_running(worker, "retry worker")
+            task = client.get(f"/tasks/{task_id}").json()
+            if task["status"] == "RETRYING":
+                replay = client.post(
+                    "/tasks",
+                    headers={"Idempotency-Key": idempotency_key},
+                    json=submission,
+                )
+                assert replay.status_code == 200
+                assert replay.json()["id"] == task_id
+                retrying_attempts.add(task["attempt_count"])
+            if task["status"] == "SUCCEEDED":
+                succeeded = task
+                break
+            time.sleep(0.01)
+        if succeeded is None:
+            pytest.fail(f"keyed retry task did not succeed; last task={task}")
+        assert retrying_attempts == {1, 2}
         assert succeeded["attempt_count"] == 3
         assert succeeded["result"] == {"succeeded_on_attempt": 3}
+
+        final_replay = client.post(
+            "/tasks",
+            headers={"Idempotency-Key": idempotency_key},
+            json=submission,
+        )
+        assert final_replay.status_code == 200
+        assert final_replay.json()["id"] == task_id
+        assert final_replay.json()["status"] == "SUCCEEDED"
 
         with schema_connection(schema_name) as connection:
             attempts = connection.execute(
@@ -325,10 +400,21 @@ def test_retry_backoff_then_success(
                 """,
                 (task_id,),
             ).fetchall()
+            keyed_task_count = connection.execute(
+                "SELECT count(*) FROM tasks WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()[0]
+        assert keyed_task_count == 1
         assert [(row[0], row[1]) for row in attempts] == [
             (1, "FAILED"),
             (2, "FAILED"),
             (3, "SUCCEEDED"),
+        ]
+        replayed_history = client.get(f"/tasks/{task_id}/attempts").json()["items"]
+        assert [item["status"] for item in replayed_history] == [
+            "FAILED",
+            "FAILED",
+            "SUCCEEDED",
         ]
         first_wait = (attempts[1][2] - attempts[0][3]).total_seconds()
         second_wait = (attempts[2][2] - attempts[1][3]).total_seconds()
@@ -337,14 +423,15 @@ def test_retry_backoff_then_success(
         assert attempts[0][4] and "attempt 1" in attempts[0][4]
         assert attempts[1][4] and "attempt 2" in attempts[1][4]
         print(
-            "RETRY_SUCCESS delays_ms="
+            "RETRY_SUCCESS keyed_tasks=1 delays_ms="
             f"{first_wait * 1000:.1f},{second_wait * 1000:.1f} "
             "history=FAILED,FAILED,SUCCEEDED"
         )
     finally:
-        worker_output = stop_process(worker)
+        worker_output = stop_process(worker) if worker is not None else ""
         scheduler_output = stop_process(scheduler)
-        assert worker.returncode == 0, worker_output
+        if worker is not None:
+            assert worker.returncode == 0, worker_output
         assert "task_retry_scheduled" in worker_output, worker_output
         assert "task_retry_promoted" in scheduler_output, scheduler_output
 

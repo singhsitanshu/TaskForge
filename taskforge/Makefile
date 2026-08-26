@@ -1,4 +1,4 @@
-.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-api test-migrations test-worker test-heartbeats test-leases
+.PHONY: build up down logs health lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases
 
 build:
 	docker compose build
@@ -65,8 +65,11 @@ test-retries:
 	docker compose --profile test run --rm --build recovery-tests go test -race -v -count=1 ./internal/repository -run RetryPromotion
 	docker compose --profile test run --rm --build integration-tests pytest -q -s tests/test_recovery_e2e.py
 
+test-idempotency:
+	docker compose --profile test run --rm --build integration-tests pytest -q -s tests/test_idempotency_api.py
+
 test-api:
-	docker compose --profile test run --rm --build integration-tests pytest -q tests/test_task_api.py
+	docker compose --profile test run --rm --build integration-tests pytest -q api/tests tests/test_task_api.py tests/test_idempotency_api.py
 
 test-migrations:
 	docker compose --profile test run --rm --build integration-tests pytest -q tests/test_migrations.py

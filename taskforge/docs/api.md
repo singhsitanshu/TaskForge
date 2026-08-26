@@ -4,7 +4,9 @@ The FastAPI service owns the public task contract. All endpoints use JSON and re
 
 ## Submit a task
 
-`POST /tasks` creates a task in `QUEUED` status and returns `201 Created`.
+`POST /tasks` accepts an optional, case-sensitive `Idempotency-Key` header. Without the header it creates a fresh `QUEUED` task and returns `201 Created`. With the header, the first semantic submission returns `201`; an identical replay returns the existing task with `200`, including after completion or cancellation. Same-key submissions with different semantics return `409` and error code `IDEMPOTENCY_KEY_REUSE`.
+
+Keys are 1–255 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, `:`, `/`, `+`, `=`, and `-`. They are global because TaskForge is currently single-tenant. The deprecated JSON `idempotency_key` field remains accepted for backward compatibility; new clients should use the header, and header/body values must match if both are present.
 
 Request fields:
 
@@ -16,7 +18,9 @@ Request fields:
 | `priority` | no | Signed 16-bit value; higher values are claimed first. |
 | `max_attempts` | no | Between 1 and 100; counts every claimed attempt, including failed and abandoned attempts. |
 | `scheduled_at` | no | ISO 8601 timestamp; defaults to database time. |
-| `idempotency_key` | no | Unique within a queue. Duplicate submissions return `409`. |
+| `idempotency_key` | no | Deprecated body alternative to the `Idempotency-Key` header. |
+
+The fingerprint covers `task_type`, canonicalized `payload`, `priority`, `max_attempts`, `queue`, and optional `scheduled_at`. JSON object order does not matter; array order does. When a client loses a response, it should repeat the same request and key. New work needs a new key or no key.
 
 ## Get a task
 
@@ -48,6 +52,8 @@ Task responses expose `claimed_by_worker_id` and `lease_expires_at`. Both are no
 `GET /tasks/{id}/attempts` returns `{ "items": [...] }` with durable attempt history ordered by `attempt_number` ascending. Unknown tasks return `404`; a task with no attempts returns an empty list.
 
 Each item includes `id`, `task_id`, `worker_id`, `attempt_number`, `status`, `leased_at`, `started_at`, `finished_at`, `output`, `error`, `created_at`, and `updated_at`. `FAILED` records a handler error; `ABANDONED` identifies lease-loss recovery with `lease_expired`. Internal ownership secrets are not exposed.
+
+Submission replay returns the original task, so this endpoint naturally returns that task's complete attempt history. Submission idempotency does not guarantee exactly-once handler execution or external side effects.
 
 ## List workers
 

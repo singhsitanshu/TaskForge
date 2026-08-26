@@ -81,6 +81,8 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 "000004_task_leases",
                 "000005_expired_lease_recovery",
                 "000006_task_retries",
+                "000007_submission_idempotency",
+                "000008_observability_queue_time",
             ]
 
             statuses = [
@@ -108,7 +110,7 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                 )
             }
             assert {
-                "tasks_queue_idempotency_key_idx",
+                "tasks_idempotency_key_idx",
                 "tasks_dispatch_idx",
                 "tasks_running_lease_idx",
                 "tasks_status_updated_idx",
@@ -149,15 +151,35 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
 
             connection.execute(
                 """
-                INSERT INTO tasks (queue, task_type, idempotency_key)
-                VALUES ('critical', 'test.noop', 'same-request')
+                INSERT INTO tasks (
+                    queue, task_type, idempotency_key, request_fingerprint
+                )
+                VALUES ('critical', 'test.noop', 'same-request', repeat('a', 64))
                 """
             )
             with pytest.raises(errors.UniqueViolation):
                 connection.execute(
                     """
-                    INSERT INTO tasks (queue, task_type, idempotency_key)
-                    VALUES ('critical', 'test.noop', 'same-request')
+                    INSERT INTO tasks (
+                        queue, task_type, idempotency_key, request_fingerprint
+                    )
+                    VALUES ('another-queue', 'test.noop', 'same-request', repeat('a', 64))
+                    """
+                )
+
+            with pytest.raises(errors.CheckViolation):
+                connection.execute(
+                    """
+                    INSERT INTO tasks (task_type, idempotency_key)
+                    VALUES ('missing-fingerprint', 'missing-fingerprint')
+                    """
+                )
+
+            with pytest.raises(errors.CheckViolation):
+                connection.execute(
+                    """
+                    INSERT INTO tasks (task_type, request_fingerprint)
+                    VALUES ('missing-key', repeat('b', 64))
                     """
                 )
 

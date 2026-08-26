@@ -4,7 +4,10 @@ go 1.23.0
 
 toolchain go1.23.12
 
-require github.com/jackc/pgx/v5 v5.7.6
+require (
+	github.com/jackc/pgx/v5 v5.7.6
+	github.com/prometheus/client_golang v1.20.5
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect

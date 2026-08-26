@@ -1,18 +1,23 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
 from app.domain import TaskStatus
-from app.repositories import DuplicateTaskError
 from app.schemas import (
+    IdempotencyKey,
     TaskAttemptListResponse,
     TaskAttemptResponse,
     TaskCreate,
     TaskListResponse,
     TaskResponse,
 )
-from app.services import TaskConflictError, TaskNotFoundError, TaskService
+from app.services import (
+    IdempotencyKeyReuseError,
+    TaskConflictError,
+    TaskNotFoundError,
+    TaskService,
+)
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -27,16 +32,38 @@ TaskServiceDependency = Annotated[TaskService, Depends(get_task_service)]
 @router.post("", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 async def submit_task(
     request: TaskCreate,
+    response: Response,
     service: TaskServiceDependency,
+    idempotency_key_header: Annotated[
+        IdempotencyKey | None,
+        Header(alias="Idempotency-Key"),
+    ] = None,
 ) -> TaskResponse:
+    if (
+        idempotency_key_header is not None
+        and request.idempotency_key is not None
+        and idempotency_key_header != request.idempotency_key
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "IDEMPOTENCY_KEY_MISMATCH",
+                "message": "header and deprecated body idempotency keys differ",
+            },
+        )
+    idempotency_key = idempotency_key_header or request.idempotency_key
     try:
-        task = await service.submit(request.to_domain())
-    except DuplicateTaskError as exc:
+        result = await service.submit(request.to_domain(idempotency_key=idempotency_key))
+    except IdempotencyKeyReuseError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="a task with this queue and idempotency key already exists",
+            detail={
+                "code": "IDEMPOTENCY_KEY_REUSE",
+                "message": "idempotency key was already used for another submission",
+            },
         ) from exc
-    return TaskResponse.from_domain(task)
+    response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
+    return TaskResponse.from_domain(result.task)
 
 
 @router.get("/{task_id}", response_model=TaskResponse)

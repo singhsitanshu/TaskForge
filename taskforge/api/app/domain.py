@@ -37,12 +37,14 @@ class Task:
     max_attempts: int
     attempt_count: int
     scheduled_at: datetime
+    queued_at: datetime
     claimed_by_worker_id: UUID | None
     lease_expires_at: datetime | None
     completed_at: datetime | None
     result: dict[str, Any] | None
     last_error: str | None
     idempotency_key: str | None
+    request_fingerprint: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -56,6 +58,12 @@ class NewTask:
     max_attempts: int
     scheduled_at: datetime | None
     idempotency_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SubmitTaskResult:
+    task: Task
+    created: bool
 
 
 @dataclass(frozen=True, slots=True)

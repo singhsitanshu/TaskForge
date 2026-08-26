@@ -17,7 +17,12 @@ TaskType = Annotated[
 ]
 IdempotencyKey = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9._~:/+=-]+$",
+    ),
 ]
 
 
@@ -32,7 +37,7 @@ class TaskCreate(BaseModel):
     scheduled_at: datetime | None = None
     idempotency_key: IdempotencyKey | None = None
 
-    def to_domain(self) -> NewTask:
+    def to_domain(self, *, idempotency_key: str | None = None) -> NewTask:
         return NewTask(
             queue=self.queue,
             task_type=self.task_type,
@@ -40,7 +45,7 @@ class TaskCreate(BaseModel):
             priority=self.priority,
             max_attempts=self.max_attempts,
             scheduled_at=self.scheduled_at,
-            idempotency_key=self.idempotency_key,
+            idempotency_key=idempotency_key,
         )
 
 
@@ -56,6 +61,7 @@ class TaskResponse(BaseModel):
     max_attempts: int
     attempt_count: int
     scheduled_at: datetime
+    queued_at: datetime
     claimed_by_worker_id: UUID | None
     lease_expires_at: datetime | None
     completed_at: datetime | None

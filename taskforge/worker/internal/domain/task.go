@@ -45,6 +45,9 @@ type ClaimedTask struct {
 	AttemptID      string
 	AttemptNumber  int16
 	LeaseExpiresAt time.Time
+	CreatedAt      time.Time
+	QueuedAt       time.Time
+	StartedAt      time.Time
 	Type           string
 	Payload        json.RawMessage
 }

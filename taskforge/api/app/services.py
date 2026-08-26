@@ -1,10 +1,42 @@
+import logging
 from collections.abc import Sequence
+from typing import Protocol
 from uuid import UUID
 
 from app.config import HeartbeatSettings
-from app.domain import NewTask, Task, TaskAttempt, TaskStatus, Worker, WorkerRecord
+from app.domain import (
+    NewTask,
+    SubmitTaskResult,
+    Task,
+    TaskAttempt,
+    TaskStatus,
+    Worker,
+    WorkerRecord,
+)
+from app.idempotency import idempotency_key_hash, submission_fingerprint
 from app.liveness import classify_worker_liveness
-from app.repositories import DuplicateTaskError, TaskRepository, WorkerRepository
+from app.repositories import TaskRepository, WorkerRepository
+
+logger = logging.getLogger(__name__)
+
+
+class TaskMetrics(Protocol):
+    def record_submission(self, outcome: str) -> None: ...
+
+    def record_cancellation(self, outcome: str) -> None: ...
+
+    def observe_task_total_latency(self, seconds: float) -> None: ...
+
+
+class NoopTaskMetrics:
+    def record_submission(self, outcome: str) -> None:
+        pass
+
+    def record_cancellation(self, outcome: str) -> None:
+        pass
+
+    def observe_task_total_latency(self, seconds: float) -> None:
+        pass
 
 
 class TaskNotFoundError(Exception):
@@ -21,12 +53,52 @@ class TaskConflictError(Exception):
         super().__init__(f"task in {status} state cannot be cancelled")
 
 
-class TaskService:
-    def __init__(self, repository: TaskRepository) -> None:
-        self._repository = repository
+class IdempotencyKeyReuseError(Exception):
+    pass
 
-    async def submit(self, new_task: NewTask) -> Task:
-        return await self._repository.create(new_task)
+
+class TaskService:
+    def __init__(
+        self,
+        repository: TaskRepository,
+        metrics: TaskMetrics | None = None,
+    ) -> None:
+        self._repository = repository
+        self._metrics = metrics or NoopTaskMetrics()
+
+    async def submit(self, new_task: NewTask) -> SubmitTaskResult:
+        fingerprint = (
+            submission_fingerprint(new_task) if new_task.idempotency_key is not None else None
+        )
+        result = await self._repository.submit(new_task, fingerprint)
+        if result.task.request_fingerprint != fingerprint:
+            assert new_task.idempotency_key is not None
+            logger.info(
+                "task submission idempotency conflict",
+                extra={
+                    "event": "task_submission_idempotency_conflict",
+                    "task_id": str(result.task.id),
+                    "idempotency_key_hash": idempotency_key_hash(new_task.idempotency_key),
+                    "request_fingerprint": fingerprint[:16],
+                },
+            )
+            self._metrics.record_submission("idempotency_conflict")
+            raise IdempotencyKeyReuseError
+
+        if new_task.idempotency_key is not None:
+            logger.info(
+                "task submission created" if result.created else "task submission replayed",
+                extra={
+                    "event": (
+                        "task_submission_created" if result.created else "task_submission_replayed"
+                    ),
+                    "task_id": str(result.task.id),
+                    "idempotency_key_hash": idempotency_key_hash(new_task.idempotency_key),
+                    "request_fingerprint": fingerprint[:16],
+                },
+            )
+        self._metrics.record_submission("created" if result.created else "replayed")
+        return result
 
     async def get(self, task_id: UUID) -> Task:
         task = await self._repository.get(task_id)
@@ -52,13 +124,21 @@ class TaskService:
     async def cancel(self, task_id: UUID) -> Task:
         cancelled = await self._repository.cancel_active(task_id)
         if cancelled is not None:
+            self._metrics.record_cancellation("cancelled")
+            if cancelled.completed_at is not None:
+                self._metrics.observe_task_total_latency(
+                    (cancelled.completed_at - cancelled.created_at).total_seconds()
+                )
             return cancelled
 
         task = await self._repository.get(task_id)
         if task is None:
+            self._metrics.record_cancellation("not_found")
             raise TaskNotFoundError
         if task.status is TaskStatus.CANCELLED:
+            self._metrics.record_cancellation("already_cancelled")
             return task
+        self._metrics.record_cancellation("conflict")
         raise TaskConflictError(task.status)
 
     async def list_attempts(self, task_id: UUID) -> Sequence[TaskAttempt]:
@@ -107,7 +187,7 @@ class WorkerService:
 
 
 __all__ = [
-    "DuplicateTaskError",
+    "IdempotencyKeyReuseError",
     "TaskConflictError",
     "TaskNotFoundError",
     "TaskService",
