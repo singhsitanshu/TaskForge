@@ -1,4 +1,4 @@
-.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
+.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-tf012e2 benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
 
 build:
 	docker compose build
@@ -116,6 +116,10 @@ benchmark-release:
 
 benchmark-e1-noop:
 	python3 -m benchmarks.e1 --project taskforge-tf012-e1-noop
+
+benchmark-tf012e2:
+	@test -n "$(E1_RESULTS)" || (printf 'usage: make benchmark-tf012e2 E1_RESULTS=benchmarks/results/<trusted-e1-run>/results.json\n' && exit 2)
+	python3 -m benchmarks.e2 --project taskforge-tf012-e2-io50 --e1-results "$(E1_RESULTS)"
 
 benchmark-dev:
 	@printf 'UNPUBLISHABLE development run: dirty source is permitted and recorded\n'

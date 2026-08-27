@@ -1,0 +1,16 @@
+{
+  "name": "tf-012e2-io50",
+  "description": "Publishable TF-012E2 synthetic 50 ms wait scaling experiment.",
+  "minimum_public_trials": 3,
+  "required_blocks": 3,
+  "required_public_scenarios": ["io50_scaling"],
+  "random_seed": 120122,
+  "cooldown_seconds": 1,
+  "warmup_tasks": 100,
+  "scaling_workers": [1, 4, 8, 16],
+  "io_tasks": 1000,
+  "workload": {
+    "task_type": "test.sleep",
+    "duration_ms": 50
+  }
+}

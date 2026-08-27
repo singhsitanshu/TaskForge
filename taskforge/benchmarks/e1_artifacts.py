@@ -20,18 +20,18 @@ PLOT_NAMES = (
 )
 
 
-def valid_results(document: dict[str, Any]) -> list[dict[str, Any]]:
+def valid_results(document: dict[str, Any], scenario: str = "noop_scaling") -> list[dict[str, Any]]:
     return [
         item
         for item in document.get("results", [])
-        if item.get("scenario") == "noop_scaling"
+        if item.get("scenario") == scenario
         and item.get("classification") == "PUBLIC"
         and item.get("valid") is True
     ]
 
 
-def summary_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
-    results = valid_results(document)
+def summary_rows(document: dict[str, Any], scenario: str = "noop_scaling") -> list[dict[str, Any]]:
+    results = valid_results(document, scenario)
     by_worker: dict[int, list[dict[str, Any]]] = {}
     for item in results:
         by_worker.setdefault(int(item["workers"]), []).append(item)
@@ -80,8 +80,8 @@ def median_measurement(items: list[dict[str, Any]], path: tuple[str, ...]) -> fl
     return statistics.median(values) if values else None
 
 
-def latency_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
-    results = valid_results(document)
+def latency_rows(document: dict[str, Any], scenario: str = "noop_scaling") -> list[dict[str, Any]]:
+    results = valid_results(document, scenario)
     rows = []
     for workers in sorted({int(item["workers"]) for item in results}):
         items = [item for item in results if int(item["workers"]) == workers]

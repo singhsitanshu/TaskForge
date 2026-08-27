@@ -18,6 +18,7 @@ required on the host: the load generator is built in Docker.
 ```text
 make benchmark-trust-smoke
 make benchmark-release
+make benchmark-tf012e2 E1_RESULTS=benchmarks/results/<trusted-e1-run>/results.json
 ```
 
 Both trusted targets refuse a dirty working tree before building images or
@@ -61,6 +62,12 @@ Raw quantiles use archived timestamps and documented type-7 interpolation.
 Prometheus histogram quantiles use per-series start/end bucket deltas and are
 allowed only when the raw value lies in the corresponding observed bucket.
 Neither source is silently substituted for the other.
+
+The TF-012E2 command is fixed to `test.sleep` with `duration_ms=50`, workers
+1/4/8/16, three reset blocks, and 1,000 tasks per configuration by default. It
+requires an external trusted TF-012E1 `results.json` for the mechanically derived
+no-op speedup comparison. `python3 -m benchmarks.e2 --dry-run` prints the scoped
+contract without starting Docker or executing tasks.
 
 ## Publication policy
 
