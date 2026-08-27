@@ -115,8 +115,8 @@ benchmark-release:
 	python3 -m benchmarks.trusted --profile release --project taskforge-tf012-release
 
 benchmark-dev:
-	@printf 'UNPUBLISHABLE development run: legacy schema and no trust verdict\n'
-	python3 benchmarks/run.py all --profile baseline
+	@printf 'UNPUBLISHABLE development run: dirty source is permitted and recorded\n'
+	python3 -m benchmarks.trusted --development --profile trust-smoke --project taskforge-tf012-development
 
 benchmark-scaling:
 	@printf 'UNPUBLISHABLE development run\n'

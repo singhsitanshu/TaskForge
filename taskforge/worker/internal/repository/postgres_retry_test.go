@@ -116,13 +116,15 @@ func TestRetryAttemptsKeepIndependentQueueEntryTimestamps(t *testing.T) {
 	); err != nil {
 		t.Fatalf("schedule retry: %v", err)
 	}
-	if _, err := database.pool.Exec(ctx, `
+	var secondQueueExpected time.Time
+	if err := database.pool.QueryRow(ctx, `
 		UPDATE tasks
 		SET status = 'QUEUED',
 		    queued_at = clock_timestamp(),
 		    scheduled_at = clock_timestamp()
 		WHERE id = $1::uuid AND status = 'RETRYING'
-	`, taskID); err != nil {
+		RETURNING queued_at
+	`, taskID).Scan(&secondQueueExpected); err != nil {
 		t.Fatalf("promote retry fixture: %v", err)
 	}
 
@@ -145,6 +147,9 @@ func TestRetryAttemptsKeepIndependentQueueEntryTimestamps(t *testing.T) {
 	if !firstQueueAfter.Equal(firstQueueBefore) {
 		t.Fatalf("first queue entry mutated: before=%s after=%s", firstQueueBefore, firstQueueAfter)
 	}
+	if !secondQueue.Equal(secondQueueExpected) {
+		t.Fatalf("second queue entry was not copied from task: task=%s attempt=%s", secondQueueExpected, secondQueue)
+	}
 	if firstStart.Before(firstQueueAfter) || secondStart.Before(secondQueue) {
 		t.Fatalf(
 			"negative queue wait: first=%s second=%s",
@@ -155,6 +160,11 @@ func TestRetryAttemptsKeepIndependentQueueEntryTimestamps(t *testing.T) {
 	if !secondQueue.After(firstQueueAfter) {
 		t.Fatalf("retry queue entry did not advance: first=%s second=%s", firstQueueAfter, secondQueue)
 	}
+	t.Logf(
+		"RETRY_QUEUE_WAIT attempt1=%s attempt2=%s",
+		firstStart.Sub(firstQueueAfter),
+		secondStart.Sub(secondQueue),
+	)
 }
 
 func TestRetryableFailureExhaustionAndStaleOwner(t *testing.T) {

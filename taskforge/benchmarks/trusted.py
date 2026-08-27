@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import urllib.request
+import uuid
 from typing import Any
 
 from benchmarks.run import (
@@ -76,7 +77,7 @@ def command_value(arguments: list[str]) -> str:
 
 
 def source_provenance(*, require_clean: bool) -> dict[str, Any]:
-    status = command_value(["git", "status", "--porcelain", "--untracked-files=all"])
+    status = command_value(["git", "status", "--porcelain"])
     clean = not status
     if require_clean and not clean:
         raise BenchmarkError(
@@ -97,6 +98,29 @@ def source_provenance(*, require_clean: bool) -> dict[str, Any]:
         "clean": clean,
         "git_status_porcelain": status,
     }
+
+
+def run_contract(*, development: bool) -> dict[str, Any]:
+    publishable = not development
+    return {
+        "publishable": publishable,
+        "publication_status": "PUBLISHABLE" if publishable else "UNPUBLISHABLE",
+        "source": source_provenance(require_clean=publishable),
+    }
+
+
+def new_run_id(source: dict[str, Any], profile_name: str) -> str:
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    nonce = uuid.uuid4().hex[:12]
+    return f"{timestamp}_{source['git_commit_sha'][:12]}_{profile_name}_{nonce}"
+
+
+def create_run_directory(path: pathlib.Path) -> pathlib.Path:
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise BenchmarkError(f"refusing to overwrite existing result directory: {path}") from exc
+    return path
 
 
 def harness_identity() -> dict[str, Any]:
@@ -1184,14 +1208,12 @@ def main() -> int:
         raise BenchmarkError(
             "publishable runs may not skip image builds or recorded regression commands"
         )
-    source = source_provenance(require_clean=publishable)
+    contract = run_contract(development=arguments.development)
+    source = contract["source"]
     profile = json.loads((BENCHMARKS / "config" / f"{arguments.profile}.json").read_text())
-    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
-    run_id = f"{timestamp}_{source['git_commit_sha'][:12]}_{arguments.profile}"
+    run_id = new_run_id(source, arguments.profile)
     output_dir = arguments.output_dir or BENCHMARKS / "results" / run_id
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise BenchmarkError(f"result directory already exists and is not empty: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    create_run_directory(output_dir)
 
     harness = Harness(profile, arguments.project, arguments.keep)
     document: dict[str, Any] = {
@@ -1200,6 +1222,7 @@ def main() -> int:
         "run_id": run_id,
         "profile": profile,
         "publishable": publishable,
+        "publication_status": contract["publication_status"],
         "started_at": dt.datetime.now(dt.UTC).isoformat(),
         "source": source,
         "harness": harness_identity(),
@@ -1233,6 +1256,8 @@ def main() -> int:
         document["warmup"] = warmup(harness, int(profile.get("warmup_tasks", 20)))
         environment = document["environment"]
         trial_provenance = {
+            "publishable": publishable,
+            "publication_status": contract["publication_status"],
             "source": source,
             "harness": document["harness"],
             "images": document["images"],
@@ -1241,11 +1266,15 @@ def main() -> int:
                 for key in (
                     "captured_at",
                     "platform",
+                    "os",
                     "host_cpu",
                     "host_logical_cpus",
                     "host_memory_bytes",
                     "docker_version",
+                    "docker_info",
                     "postgresql",
+                    "go_version",
+                    "python_version",
                 )
             },
         }

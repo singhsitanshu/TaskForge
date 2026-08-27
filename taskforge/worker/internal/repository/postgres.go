@@ -156,7 +156,7 @@ func (r *Postgres) ClaimNext(
 		)
 		SELECT $1::uuid, $2::uuid, $3, 'RUNNING', attempt_clock.now, attempt_clock.now, $4, $5
 		FROM (
-			SELECT GREATEST(clock_timestamp(), transaction_timestamp()) AS now
+			SELECT GREATEST(clock_timestamp(), transaction_timestamp(), $4) AS now
 		) AS attempt_clock
 		RETURNING id::text, started_at
 	`

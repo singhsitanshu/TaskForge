@@ -378,3 +378,93 @@ def test_migration_applies_constraints_indexes_and_rolls_back() -> None:
                     sql.Identifier(schema_name)
                 )
             )
+
+
+def test_attempt_timing_migration_preserves_legacy_unknowns_and_rolls_back() -> None:
+    assert DATABASE_URL is not None
+    schema_name = f"attempt_timing_migration_test_{uuid.uuid4().hex}"
+    migration_up = MIGRATIONS / "000010_attempt_timing_evidence.up.sql"
+    migration_down = MIGRATIONS / "000010_attempt_timing_evidence.down.sql"
+    earlier_up_sql = "\n".join(
+        path.read_text()
+        for path in sorted(MIGRATIONS.glob("*.up.sql"))
+        if path.name < migration_up.name
+    )
+
+    with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
+        try:
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            connection.execute(earlier_up_sql)
+            worker_id = fetch_scalar(
+                connection,
+                """
+                INSERT INTO workers (instance_id, name)
+                VALUES ('legacy-attempt-worker', 'legacy-attempt-worker')
+                RETURNING id
+                """,
+            )
+            task_id = fetch_scalar(
+                connection,
+                """
+                INSERT INTO tasks (task_type)
+                VALUES ('legacy-attempt')
+                RETURNING id
+                """,
+            )
+            connection.execute(
+                """
+                INSERT INTO task_attempts (
+                    task_id, worker_id, attempt_number, status, started_at
+                )
+                VALUES (%s, %s, 1, 'RUNNING', clock_timestamp())
+                """,
+                (task_id, worker_id),
+            )
+
+            connection.execute(migration_up.read_text())
+            legacy_queue_entry = fetch_scalar(
+                connection,
+                """
+                SELECT queue_entered_at
+                FROM task_attempts
+                WHERE task_id = %s AND attempt_number = 1
+                """,
+                (task_id,),
+            )
+            assert legacy_queue_entry is None
+            assert fetch_scalar(
+                connection,
+                "SELECT count(*) FROM schema_migrations WHERE version = %s",
+                ("000010_attempt_timing_evidence",),
+            ) == 1
+
+            connection.execute(migration_down.read_text())
+            assert fetch_scalar(
+                connection,
+                "SELECT count(*) FROM schema_migrations WHERE version = %s",
+                ("000010_attempt_timing_evidence",),
+            ) == 0
+            assert fetch_scalar(
+                connection,
+                """
+                SELECT count(*)
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'task_attempts'
+                  AND column_name = 'queue_entered_at'
+                """,
+                (schema_name,),
+            ) == 0
+        finally:
+            connection.rollback()
+            connection.execute("SET search_path TO public")
+            connection.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )

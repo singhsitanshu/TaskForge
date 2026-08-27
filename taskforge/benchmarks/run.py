@@ -60,6 +60,28 @@ def run_command(
     return result
 
 
+def host_cpu_description() -> str:
+    if sys.platform == "darwin":
+        result = run_command(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], check=False, timeout=30
+        )
+        if result.stdout.strip():
+            return result.stdout.strip()
+    cpuinfo = pathlib.Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        for line in cpuinfo.read_text(errors="replace").splitlines():
+            if line.lower().startswith(("model name", "hardware")) and ":" in line:
+                return line.split(":", 1)[1].strip()
+    return platform.processor().strip() or platform.machine()
+
+
+def host_memory_bytes() -> int | None:
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
 def percentile(values: list[float], fraction: float) -> float | None:
     if not values:
         return None
@@ -409,9 +431,6 @@ class Harness:
             "docker_version": ["docker", "version", "--format", "{{json .}}"],
             "docker_info": ["docker", "info", "--format", "{{json .}}"],
             "go_version": ["docker", "run", "--rm", "golang:1.23-alpine", "go", "version"],
-            "host_cpu": ["sysctl", "-n", "machdep.cpu.brand_string"],
-            "host_logical_cpus": ["sysctl", "-n", "hw.logicalcpu"],
-            "host_memory_bytes": ["sysctl", "-n", "hw.memsize"],
         }
         values: dict[str, Any] = {}
         for name, command in commands.items():
@@ -421,7 +440,12 @@ class Harness:
             {
                 "captured_at": dt.datetime.now(dt.UTC).isoformat(),
                 "platform": platform.platform(),
+                "os": {"system": platform.system(), "release": platform.release()},
+                "host_cpu": host_cpu_description(),
+                "host_logical_cpus": os.cpu_count(),
+                "host_memory_bytes": host_memory_bytes(),
                 "python": platform.python_version(),
+                "python_version": platform.python_version(),
                 "compose_project": self.project,
                 "api_replicas": 1,
                 "profile": self.profile,
@@ -478,7 +502,7 @@ def raw_measurements(harness: Harness, queue: str) -> dict[str, Any]:
             JOIN selected_tasks AS task ON task.id = attempt.task_id
         ), durations AS (
             SELECT
-                EXTRACT(EPOCH FROM (attempt.started_at - task.queued_at)) AS queue_wait,
+                EXTRACT(EPOCH FROM (attempt.started_at - attempt.queue_entered_at)) AS queue_wait,
                 EXTRACT(EPOCH FROM (attempt.finished_at - attempt.started_at)) AS execution,
                 EXTRACT(EPOCH FROM (task.completed_at - task.created_at)) AS total_latency,
                 EXTRACT(EPOCH FROM (attempt.started_at - attempt.leased_at)) AS claim_to_start

@@ -272,12 +272,33 @@ def verify_manifest(directory: pathlib.Path) -> tuple[bool, list[str]]:
         return False, ["manifest.json missing"]
     manifest = json.loads(manifest_path.read_text())
     errors = []
+    if manifest.get("algorithm") != "sha256":
+        errors.append("manifest algorithm is not sha256")
+    listed: set[str] = set()
     for item in manifest.get("artifacts", []):
-        path = directory / item["path"]
+        relative = item.get("path", "")
+        parts = pathlib.PurePosixPath(relative).parts
+        if not relative or pathlib.PurePosixPath(relative).is_absolute() or ".." in parts:
+            errors.append(f"unsafe artifact path: {relative!r}")
+            continue
+        if relative in listed:
+            errors.append(f"{relative} listed more than once")
+            continue
+        listed.add(relative)
+        path = directory / relative
         if not path.exists():
-            errors.append(f"{item['path']} missing")
-        elif sha256_file(path) != item["sha256"]:
-            errors.append(f"{item['path']} hash mismatch")
+            errors.append(f"{relative} missing")
+        elif sha256_file(path) != item.get("sha256"):
+            errors.append(f"{relative} hash mismatch")
+        elif path.stat().st_size != item.get("bytes"):
+            errors.append(f"{relative} size mismatch")
+    actual = {
+        path.relative_to(directory).as_posix()
+        for path in directory.rglob("*")
+        if path.is_file() and path != manifest_path
+    }
+    for relative in sorted(actual - listed):
+        errors.append(f"{relative} is not listed")
     return not errors, errors
 
 

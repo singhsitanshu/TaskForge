@@ -24,7 +24,9 @@ Both trusted targets refuse a dirty working tree before building images or
 creating results. `benchmark-release` (also `benchmark-all`) uses
 `config/release.json`, runs regression commands first, and requires every trust
 gate to pass. Direct legacy scenario targets are explicitly UNPUBLISHABLE
-development diagnostics; they cannot generate a trusted verdict. Trusted
+development diagnostics; they cannot generate a trusted verdict. `benchmark-dev`
+uses the provenance-aware harness, permits a dirty tree, and records
+`publication_status: UNPUBLISHABLE` in the run and every trial. Trusted
 direct invocation supports `--keep` and `--output-dir`:
 
 ```text

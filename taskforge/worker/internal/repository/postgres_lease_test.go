@@ -37,12 +37,26 @@ func TestClaimCreatesAtomicFutureLease(t *testing.T) {
 
 	var status, owner string
 	var attemptCount, attempts int
-	var leaseExpiresAt, databaseNow time.Time
+	var leaseExpiresAt, databaseNow, queueEnteredAt, attemptStartedAt time.Time
 	err = database.pool.QueryRow(
 		context.Background(),
-		`SELECT status::text, claimed_by_worker_id::text, attempt_count, lease_expires_at, clock_timestamp(), (SELECT count(*) FROM task_attempts WHERE task_id = tasks.id) FROM tasks WHERE id = $1::uuid`,
+		`SELECT status::text, claimed_by_worker_id::text, attempt_count, lease_expires_at,
+		        clock_timestamp(),
+		        (SELECT count(*) FROM task_attempts WHERE task_id = tasks.id),
+		        (SELECT queue_entered_at FROM task_attempts WHERE task_id = tasks.id),
+		        (SELECT started_at FROM task_attempts WHERE task_id = tasks.id)
+		 FROM tasks WHERE id = $1::uuid`,
 		taskID,
-	).Scan(&status, &owner, &attemptCount, &leaseExpiresAt, &databaseNow, &attempts)
+	).Scan(
+		&status,
+		&owner,
+		&attemptCount,
+		&leaseExpiresAt,
+		&databaseNow,
+		&attempts,
+		&queueEnteredAt,
+		&attemptStartedAt,
+	)
 	if err != nil {
 		t.Fatalf("read claimed task: %v", err)
 	}
@@ -51,6 +65,48 @@ func TestClaimCreatesAtomicFutureLease(t *testing.T) {
 	}
 	if !leaseExpiresAt.After(databaseNow) || !claimed.LeaseExpiresAt.Equal(leaseExpiresAt) {
 		t.Fatalf("invalid lease claimed=%s persisted=%s now=%s", claimed.LeaseExpiresAt, leaseExpiresAt, databaseNow)
+	}
+	if !queueEnteredAt.Equal(claimed.QueuedAt) || !attemptStartedAt.Equal(claimed.StartedAt) {
+		t.Fatalf(
+			"attempt timing differs from claim: queue persisted=%s claimed=%s start persisted=%s claimed=%s",
+			queueEnteredAt,
+			claimed.QueuedAt,
+			attemptStartedAt,
+			claimed.StartedAt,
+		)
+	}
+	if attemptStartedAt.Before(queueEnteredAt) {
+		t.Fatalf("negative persisted queue wait: %s", attemptStartedAt.Sub(queueEnteredAt))
+	}
+}
+
+func TestClaimClampsAttemptStartAgainstBackwardWallClock(t *testing.T) {
+	database := newTestDatabase(t)
+	worker := registerWorkers(t, database, 1)[0]
+	ctx := context.Background()
+	taskID := insertTask(t, database, 0, time.Time{}, "")
+
+	var queueEnteredAt time.Time
+	if err := database.pool.QueryRow(ctx, `
+		UPDATE tasks
+		SET queued_at = clock_timestamp() + interval '100 milliseconds'
+		WHERE id = $1::uuid
+		RETURNING queued_at
+	`, taskID).Scan(&queueEnteredAt); err != nil {
+		t.Fatalf("simulate queue entry before backward wall-clock step: %v", err)
+	}
+
+	claimed, err := database.store.ClaimNext(ctx, worker.ID, 5*time.Second)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim across backward wall clock: task=%v error=%v", claimed, err)
+	}
+	if !claimed.QueuedAt.Equal(queueEnteredAt) || claimed.StartedAt.Before(queueEnteredAt) {
+		t.Fatalf(
+			"claim produced negative queue wait: queue=%s start=%s wait=%s",
+			queueEnteredAt,
+			claimed.StartedAt,
+			claimed.StartedAt.Sub(queueEnteredAt),
+		)
 	}
 }
 
@@ -119,6 +175,35 @@ func TestLeaseRenewalOwnershipAndTerminalRules(t *testing.T) {
 	}
 }
 
+func TestLeaseRenewalCannotShortenExistingLease(t *testing.T) {
+	database := newTestDatabase(t)
+	worker := registerWorkers(t, database, 1)[0]
+	ctx := context.Background()
+	insertTask(t, database, 0, time.Time{}, "")
+	claimed, err := database.store.ClaimNext(ctx, worker.ID, 2*time.Second)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim task: task=%v error=%v", claimed, err)
+	}
+
+	renewedExpiration, err := database.store.RenewLease(
+		ctx,
+		claimed.ID,
+		worker.ID,
+		claimed.AttemptNumber,
+		100*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("renew with clock-derived expiration behind existing lease: %v", err)
+	}
+	if renewedExpiration.Before(claimed.LeaseExpiresAt) {
+		t.Fatalf(
+			"renewal shortened lease: original=%s renewed=%s",
+			claimed.LeaseExpiresAt,
+			renewedExpiration,
+		)
+	}
+}
+
 func TestCompletionClampsTimestampAgainstBackwardWallClock(t *testing.T) {
 	database := newTestDatabase(t)
 	worker := registerWorkers(t, database, 1)[0]
@@ -138,6 +223,15 @@ func TestCompletionClampsTimestampAgainstBackwardWallClock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("simulate backward wall clock: %v", err)
 	}
+	_, err = database.pool.Exec(ctx, `
+		UPDATE tasks
+		SET created_at = clock_timestamp() + interval '100 milliseconds',
+		    queued_at = clock_timestamp() + interval '100 milliseconds'
+		WHERE id = $1::uuid
+	`, claimed.ID)
+	if err != nil {
+		t.Fatalf("move task creation ahead of current wall clock: %v", err)
+	}
 	if err := database.store.Complete(
 		ctx,
 		worker.ID,
@@ -148,16 +242,18 @@ func TestCompletionClampsTimestampAgainstBackwardWallClock(t *testing.T) {
 		t.Fatalf("complete across backward wall clock: %v", err)
 	}
 
-	var ordered bool
+	var attemptOrdered, taskOrdered bool
 	if err := database.pool.QueryRow(ctx, `
-		SELECT finished_at >= started_at AND updated_at >= created_at
-		FROM task_attempts
-		WHERE id = $1::uuid
-	`, claimed.AttemptID).Scan(&ordered); err != nil {
+		SELECT
+			(SELECT finished_at >= started_at AND updated_at >= created_at
+			 FROM task_attempts WHERE id = $1::uuid),
+			(SELECT completed_at >= created_at AND updated_at >= created_at
+			 FROM tasks WHERE id = $2::uuid)
+	`, claimed.AttemptID, claimed.ID).Scan(&attemptOrdered, &taskOrdered); err != nil {
 		t.Fatalf("read clamped attempt timestamps: %v", err)
 	}
-	if !ordered {
-		t.Fatal("completion timestamps were not clamped")
+	if !attemptOrdered || !taskOrdered {
+		t.Fatalf("completion timestamps were not clamped: attempt=%t task=%t", attemptOrdered, taskOrdered)
 	}
 }
 
@@ -221,6 +317,12 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 	if err != nil || oldClaim == nil {
 		t.Fatalf("claim old attempt: task=%v error=%v", oldClaim, err)
 	}
+	var firstQueueBefore time.Time
+	if err := database.pool.QueryRow(ctx, `
+		SELECT queue_entered_at FROM task_attempts WHERE id = $1::uuid
+	`, oldClaim.AttemptID).Scan(&firstQueueBefore); err != nil {
+		t.Fatalf("read first recovery queue evidence: %v", err)
+	}
 	if _, err := database.pool.Exec(ctx, `
 		UPDATE tasks
 		SET lease_expires_at = clock_timestamp() - interval '1 millisecond'
@@ -246,7 +348,8 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("abandon old attempt: %v", err)
 	}
-	if _, err := tx.Exec(ctx, `
+	var secondQueueExpected time.Time
+	if err := tx.QueryRow(ctx, `
 		UPDATE tasks
 		SET
 			status = 'QUEUED',
@@ -255,7 +358,8 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 			lease_expires_at = NULL,
 			last_error = 'lease_expired'
 		WHERE id = $1::uuid
-	`, oldClaim.ID); err != nil {
+		RETURNING queued_at
+	`, oldClaim.ID).Scan(&secondQueueExpected); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("requeue recovered task: %v", err)
 	}
@@ -352,6 +456,21 @@ func TestRecoveredTaskRejectsOldWorkerAndCreatesNextAttempt(t *testing.T) {
 		!attempts[1].queuedAt.After(attempts[0].queuedAt) {
 		t.Fatalf("invalid immutable recovery queue timing: %+v", attempts)
 	}
+	if !attempts[0].queuedAt.Equal(firstQueueBefore) {
+		t.Fatalf("first recovery queue entry mutated: before=%s after=%s", firstQueueBefore, attempts[0].queuedAt)
+	}
+	if !attempts[1].queuedAt.Equal(secondQueueExpected) {
+		t.Fatalf(
+			"second recovery queue entry was not copied from task: task=%s attempt=%s",
+			secondQueueExpected,
+			attempts[1].queuedAt,
+		)
+	}
+	t.Logf(
+		"RECOVERY_QUEUE_WAIT attempt1=%s attempt2=%s",
+		attempts[0].startedAt.Sub(attempts[0].queuedAt),
+		attempts[1].startedAt.Sub(attempts[1].queuedAt),
+	)
 	t.Log("STALE_OWNER renew=rejected complete=rejected fail=rejected next_attempt=2 final=SUCCEEDED")
 }
 
