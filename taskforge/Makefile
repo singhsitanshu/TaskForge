@@ -1,4 +1,4 @@
-.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
+.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
 
 build:
 	docker compose build
@@ -113,6 +113,9 @@ benchmark-trust-smoke: benchmark-smoke
 
 benchmark-release:
 	python3 -m benchmarks.trusted --profile release --project taskforge-tf012-release
+
+benchmark-e1-noop:
+	python3 -m benchmarks.e1 --project taskforge-tf012-e1-noop
 
 benchmark-dev:
 	@printf 'UNPUBLISHABLE development run: dirty source is permitted and recorded\n'
