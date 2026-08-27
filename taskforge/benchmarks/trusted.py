@@ -873,7 +873,11 @@ class TrustedRun:
             reconciliation=reconciliation,
             resource_samples=resources.samples,
             metadata=metadata,
-            extra={"arrival_rate": rate},
+            extra={
+                "arrival_rate": rate,
+                "order_index": order_index,
+                "random_seed": random_seed,
+            },
         )
 
     def api_trial(self, concurrency: int, trial: int) -> dict[str, Any]:

@@ -7,8 +7,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from benchmarks.e1_artifacts import PLOT_NAMES, generate, summary_rows
+from benchmarks.trusted import TrustedRun
 
 
 class E1ArtifactTests(unittest.TestCase):
@@ -102,6 +104,43 @@ class E1ArtifactTests(unittest.TestCase):
         document["results"][0]["valid"] = False
         row = next(item for item in summary_rows(document) if item["workers"] == 8)
         self.assertEqual(set(row["block_values"]), {2, 3})
+
+    def test_processing_trial_indexes_archived_order_and_seed(self) -> None:
+        harness = mock.MagicMock()
+        harness.loadgen.return_value = {}
+        harness.trial_configuration.return_value = {}
+        trusted = TrustedRun(harness, Path("unused"), {}, "run", {})
+        trusted.host_state = mock.MagicMock(return_value={})
+        trusted.save_trial = mock.MagicMock(return_value={})
+        sampler = mock.MagicMock()
+        sampler.samples = []
+        sampler_context = mock.MagicMock()
+        sampler_context.__enter__.return_value = sampler
+        with (
+            mock.patch("benchmarks.trusted.ResourceSampler", return_value=sampler_context),
+            mock.patch("benchmarks.trusted.prepare_trial", return_value={}),
+            mock.patch("benchmarks.trusted.finish_trial_snapshot", return_value={}),
+            mock.patch("benchmarks.trusted.capture_rows", return_value=([], [])),
+            mock.patch("benchmarks.trusted.trusted_correctness", return_value={"passed": True}),
+            mock.patch("benchmarks.trusted.build_reconciliation", return_value={"status": "PASS"}),
+        ):
+            trusted.processing_trial(
+                scenario="noop_scaling",
+                variant="w4",
+                block=2,
+                trial=2,
+                workers=4,
+                task_type="test.noop",
+                payload={},
+                count=1,
+                concurrency=1,
+                order_index=3,
+                random_seed=120121,
+            )
+        saved = trusted.save_trial.call_args.kwargs
+        self.assertEqual(saved["metadata"]["order_index"], 3)
+        self.assertEqual(saved["extra"]["order_index"], 3)
+        self.assertEqual(saved["extra"]["random_seed"], 120121)
 
 
 if __name__ == "__main__":

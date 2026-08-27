@@ -156,7 +156,7 @@ def render_report(document: dict[str, Any], artifact_prefix: str = "") -> str:
     for block in sorted({int(item["block"]) for item in results}):
         ordered = sorted(
             (item for item in results if int(item["block"]) == block),
-            key=lambda item: int(item["order_index"]),
+            key=lambda item: int(item.get("order_index") or 0),
         )
         seed = ordered[0].get("random_seed") if ordered else None
         block_orders.append(
@@ -236,7 +236,9 @@ def render_report(document: dict[str, Any], artifact_prefix: str = "") -> str:
                     for quantile in ("p50", "p95", "p99")
                 ),
             ]
-            for item in sorted(results, key=lambda value: (value["block"], value["order_index"]))
+            for item in sorted(
+                results, key=lambda value: (value["block"], value.get("order_index") or 0)
+            )
         ],
     )
     blocks_table = markdown_table(
