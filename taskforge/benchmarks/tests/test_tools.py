@@ -1,4 +1,3 @@
-import copy
 import json
 import tempfile
 import unittest
@@ -7,15 +6,8 @@ from pathlib import Path
 from benchmarks.plot import line_plot
 from benchmarks.report import render
 from benchmarks.run import BenchmarkError, Harness, parse_bytes, percentile
-from benchmarks.trust import (
-    aggregate,
-    create_manifest,
-    derive_raw,
-    evaluate_trust,
-    write_csv,
-    write_json,
-)
-from benchmarks.trusted import ATTEMPT_FIELDS, TASK_FIELDS
+from benchmarks.tests.trust_fixture import build_trust_fixture
+from benchmarks.trust import derive_raw, evaluate_trust
 
 
 class HarnessSafetyTests(unittest.TestCase):
@@ -79,93 +71,7 @@ class TrustGateTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def valid_document(self) -> dict[str, object]:
-        results = []
-        for trial in range(1, 4):
-            directory = self.root / "trials" / f"trial-{trial}"
-            directory.mkdir(parents=True)
-            tasks = [
-                {
-                    "task_id": f"task-{trial}",
-                    "task_created_at": "2026-01-01T00:00:00+00:00",
-                    "task_completed_at": "2026-01-01T00:00:02+00:00",
-                    "final_status": "SUCCEEDED",
-                    "attempt_count": "1",
-                    "task_type": "test.noop",
-                    "queue": f"q-{trial}",
-                }
-            ]
-            attempts = [
-                {
-                    "task_id": f"task-{trial}",
-                    "attempt_id": f"attempt-{trial}",
-                    "attempt_number": "1",
-                    "status": "SUCCEEDED",
-                    "worker_id": "worker-1",
-                    "worker_label": "worker-1",
-                    "task_created_at": "2026-01-01T00:00:00+00:00",
-                    "attempt_leased_at": "2026-01-01T00:00:01+00:00",
-                    "attempt_started_at": "2026-01-01T00:00:01+00:00",
-                    "attempt_finished_at": "2026-01-01T00:00:02+00:00",
-                    "queue_entered_at": "2026-01-01T00:00:00+00:00",
-                    "scheduled_at_snapshot": "2026-01-01T00:00:00+00:00",
-                    "retry_scheduled_at": "",
-                    "recovered_lease_expires_at": "",
-                    "recovered_at": "",
-                    "recovery_action": "",
-                }
-            ]
-            raw = derive_raw(tasks, attempts)
-            write_csv(directory / "tasks.csv", tasks, TASK_FIELDS)
-            write_csv(directory / "attempts.csv", attempts, ATTEMPT_FIELDS)
-            write_json(directory / "summary.json", {"raw": raw})
-            create_manifest(directory)
-            results.append(
-                {
-                    "scenario": "noop_scaling",
-                    "variant": "w1",
-                    "classification": "PUBLIC",
-                    "block": trial,
-                    "trial": trial,
-                    "workers": 1,
-                    "schedulers": 1,
-                    "count": 1,
-                    "task_type": "test.noop",
-                    "configuration": {"poll_interval": "test"},
-                    "provenance": {
-                        "source": {"git_commit_sha": "a" * 40},
-                        "machine": {"platform": "test"},
-                    },
-                    "raw": raw,
-                    "correctness": {"passed": True},
-                    "prometheus_reconciliation": {"status": "PASS"},
-                    "artifacts": {"directory": f"trials/trial-{trial}"},
-                    "valid": True,
-                }
-            )
-        document: dict[str, object] = {
-            "publishable": True,
-            "source": {
-                "clean": True,
-                "git_commit_sha": "a" * 40,
-                "git_tree_hash": "b" * 40,
-            },
-            "images": {"worker": {"image_id": "sha256:image"}},
-            "environment": {"platform": "test"},
-            "harness": {"version": "test", "files": [{"path": "x", "sha256": "c"}]},
-            "profile": {
-                "minimum_public_trials": 3,
-                "required_blocks": 3,
-                "required_public_scenarios": ["noop_scaling"],
-                "scaling_workers": [1],
-                "trial_cv_threshold": 0.1,
-                "between_block_drift_threshold": 0.1,
-            },
-            "regression": {"passed": True},
-            "artifact_reproducibility": {"passed": True},
-            "results": results,
-        }
-        document["summaries"] = aggregate(results)
-        return document
+        return build_trust_fixture(self.root)
 
     def verdict(self, document: dict[str, object]) -> str:
         return evaluate_trust(document, self.root)["overall"]["result"]
@@ -190,7 +96,6 @@ class TrustGateTests(unittest.TestCase):
 
     def test_negative_duration_fails(self) -> None:
         result = self.document["results"][0]  # type: ignore[index]
-        result["raw"] = copy.deepcopy(result["raw"])
         result["raw"]["negative_durations"]["queue_wait"] = 1
         self.assertEqual(self.verdict(self.document), "FAIL")
 

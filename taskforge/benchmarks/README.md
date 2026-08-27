@@ -31,6 +31,7 @@ direct invocation supports `--keep` and `--output-dir`:
 
 ```text
 python3 -m benchmarks.trusted --profile release --project taskforge-tf012-release
+python3 -m benchmarks.trust benchmarks/results/<run-id>
 python3 benchmarks/plot.py benchmarks/results/<timestamp>/results.json
 python3 benchmarks/report.py benchmarks/results/<timestamp>/results.json
 ```
@@ -64,11 +65,12 @@ Neither source is silently substituted for the other.
 ## Publication policy
 
 PUBLIC configurations need at least three valid trials. Headline scaling uses
-three independently reset blocks with randomized worker order, reports medians,
-CV, and block drift, and fails above the committed thresholds. A result is not
-publicly usable unless clean-source provenance, image identity, correctness,
-raw data, latency, Prometheus reconciliation, repetition, reproducibility, and
-regression gates all pass.
+three independently reset blocks with recorded randomized worker order. The
+trust gate does not invent statistical thresholds: it verifies the recorded
+trial count, independent reset/warm-up boundaries, raw evidence, and regression
+commands. A result is not publicly usable unless clean-source provenance, image
+identity, correctness, raw data, latency, Prometheus reconciliation, repetition,
+reproducibility, and regression gates all pass.
 
 ## Workloads
 

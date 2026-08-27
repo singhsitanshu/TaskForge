@@ -242,6 +242,20 @@ def regression_commands(profile_name: str) -> list[list[str]]:
             "run",
             "--rm",
             "-v",
+            f"{ROOT / 'scheduler'}:/workspace",
+            "-w",
+            "/workspace",
+            "golang:1.23-bookworm",
+            "go",
+            "test",
+            "-race",
+            "./...",
+        ],
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
             f"{BENCHMARKS / 'loadgen'}:/workspace",
             "-w",
             "/workspace",
@@ -253,6 +267,19 @@ def regression_commands(profile_name: str) -> list[list[str]]:
         [sys.executable, "-m", "unittest", "benchmarks.tests.test_tools"],
         ["docker", "compose", "build", "web"],
     ]
+
+
+def regression_category(command: list[str]) -> str | None:
+    text = " ".join(command)
+    if "integration-tests" in text:
+        return "api_integration"
+    if str(ROOT / "worker") in text:
+        return "worker"
+    if str(ROOT / "scheduler") in text:
+        return "scheduler"
+    if "benchmarks.tests" in text or str(BENCHMARKS / "loadgen") in text:
+        return "benchmark_harness"
+    return None
 
 
 def run_regressions(profile_name: str) -> dict[str, Any]:
@@ -274,6 +301,7 @@ def run_regressions(profile_name: str) -> dict[str, Any]:
         result = run_command(command, env=regression_env, check=False, timeout=1800)
         finished = dt.datetime.now(dt.UTC)
         record = {
+            "category": regression_category(command),
             "command": command,
             "started_at": started.isoformat(),
             "finished_at": finished.isoformat(),
@@ -322,6 +350,28 @@ def prometheus_targets(harness: Harness) -> list[dict[str, Any]]:
             }
         )
     return sorted(targets, key=lambda item: (item.get("job") or "", item.get("instance") or ""))
+
+
+def replica_identities(harness: Harness) -> list[dict[str, Any]]:
+    output = harness.compose("ps", "--format", "json", timeout=60)
+    replicas = []
+    for line in output.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if item.get("Service") not in {"api", "worker", "scheduler"}:
+            continue
+        replicas.append(
+            {
+                "service": item.get("Service"),
+                "name": item.get("Name"),
+                "container_id": item.get("ID"),
+                "state": item.get("State"),
+                "health": item.get("Health"),
+            }
+        )
+    return sorted(replicas, key=lambda item: (item.get("service") or "", item.get("name") or ""))
 
 
 def expected_targets(workers: int, schedulers: int) -> dict[str, int]:
@@ -375,7 +425,12 @@ def wait_for_boundary_scrape(
     )
 
 
-def prometheus_snapshot(harness: Harness, targets: list[dict[str, Any]]) -> dict[str, Any]:
+def prometheus_snapshot(
+    harness: Harness,
+    targets: list[dict[str, Any]],
+    *,
+    boundary_after: dt.datetime,
+) -> dict[str, Any]:
     metrics = harness.prometheus({name: name for name in PROMETHEUS_METRICS})
     sample_times = [
         float(row["value"][0])
@@ -388,7 +443,9 @@ def prometheus_snapshot(harness: Harness, targets: list[dict[str, Any]]) -> dict
         "captured_at": dt.datetime.now(dt.UTC).isoformat(),
         "sample_time_min": min(sample_times) if sample_times else None,
         "sample_time_max": max(sample_times) if sample_times else None,
+        "boundary_after": boundary_after.isoformat(),
         "targets": targets,
+        "replicas": replica_identities(harness),
         "metrics": metrics,
     }
 
@@ -400,16 +457,17 @@ def prepare_trial(harness: Harness, workers: int, schedulers: int) -> dict[str, 
     else:
         harness.recreate_workers(workers)
     harness.recreate_schedulers(schedulers)
+    boundary_after = dt.datetime.now(dt.UTC)
     harness.reset_prometheus()
-    targets = wait_for_boundary_scrape(harness, workers, schedulers)
-    return prometheus_snapshot(harness, targets)
+    targets = wait_for_boundary_scrape(harness, workers, schedulers, after=boundary_after)
+    return prometheus_snapshot(harness, targets, boundary_after=boundary_after)
 
 
 def finish_trial_snapshot(
     harness: Harness, workers: int, schedulers: int, trial_end: dt.datetime
 ) -> dict[str, Any]:
     targets = wait_for_boundary_scrape(harness, workers, schedulers, after=trial_end)
-    return prometheus_snapshot(harness, targets)
+    return prometheus_snapshot(harness, targets, boundary_after=trial_end)
 
 
 def warmup(harness: Harness, count: int) -> dict[str, Any]:

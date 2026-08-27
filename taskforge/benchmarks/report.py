@@ -323,7 +323,7 @@ PUBLIC scenarios require at least `{document.get("profile", {}).get("minimum_pub
 
 # 8. Reproducibility Design
 
-Headline scaling uses `{document.get("profile", {}).get("required_blocks", 3)}` independently reset blocks. Worker-count order is deterministically randomized per workload and block from archived seed `{document.get("profile", {}).get("random_seed", "n/a")}`. Medians are headline values; CV and between-block drift are gates.
+Headline scaling uses `{document.get("profile", {}).get("required_blocks", 3)}` independently reset blocks. Worker-count order is deterministically randomized per workload and block from archived seed `{document.get("profile", {}).get("random_seed", "n/a")}`. Medians, CV, and between-block drift are reported; the trust gate verifies independent blocks without inventing statistical thresholds.
 
 # 9. Noop Scaling Re-Test
 
@@ -375,7 +375,7 @@ Top-level manifest: [manifest.json]({artifact_prefix}manifest.json). Per-trial m
 
 {drift_text}
 
-Public stability is acceptable only when every reported CV and block drift is within the archived profile thresholds.
+CV and block drift remain descriptive measurements; publication trust comes from the recorded independent reset blocks and the other evidence gates.
 
 # 19. Resume-Safe Results
 

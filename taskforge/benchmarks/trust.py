@@ -1,7 +1,8 @@
-"""Pure TF-012B evidence, reconciliation, statistics, and trust-gate helpers."""
+"""Pure TF-012 evidence, reconciliation, statistics, and trust-gate helpers."""
 
 from __future__ import annotations
 
+import argparse
 import csv
 import datetime as dt
 import hashlib
@@ -12,7 +13,7 @@ import statistics
 from collections.abc import Iterable
 from typing import Any
 
-HARNESS_VERSION = "TF-012B/1"
+HARNESS_VERSION = "TF-012D/1"
 QUANTILE_METHOD = "linear interpolation at index (n - 1) * q (Hyndman-Fan type 7)"
 PUBLIC_SCENARIOS = {
     "noop_scaling",
@@ -28,6 +29,7 @@ CORE_SCALING_SCENARIOS = {"noop_scaling", "io50_scaling", "cpu_scaling"}
 COUNTER_METRICS = {
     "claimed": "taskforge_worker_tasks_claimed_total",
     "completed": "taskforge_worker_tasks_completed_total",
+    "attempts": "taskforge_task_attempts_total",
     "retries_scheduled": "taskforge_task_retries_scheduled_total",
     "retry_promotions": "taskforge_task_retries_promoted_total",
     "recoveries": "taskforge_task_recoveries_total",
@@ -39,7 +41,19 @@ HISTOGRAM_METRICS = {
     "retry_lateness": "taskforge_retry_lateness_seconds_bucket",
     "recovery": "taskforge_recovery_lag_seconds_bucket",
 }
-PROMETHEUS_METRICS = tuple(COUNTER_METRICS.values()) + tuple(HISTOGRAM_METRICS.values())
+HISTOGRAM_COMPONENT_METRICS = tuple(
+    component
+    for bucket_metric in HISTOGRAM_METRICS.values()
+    for component in (
+        bucket_metric,
+        bucket_metric.removesuffix("_bucket") + "_sum",
+        bucket_metric.removesuffix("_bucket") + "_count",
+    )
+)
+IDENTITY_METRICS = ("process_start_time_seconds",)
+PROMETHEUS_METRICS = (
+    tuple(COUNTER_METRICS.values()) + HISTOGRAM_COMPONENT_METRICS + IDENTITY_METRICS
+)
 
 
 def percentile(values: Iterable[float], fraction: float) -> float | None:
@@ -376,14 +390,42 @@ def histogram_delta(start: dict[str, Any], end: dict[str, Any], metric: str) -> 
         else:
             buckets[upper] = buckets.get(upper, 0.0) + end_value - start_value
     ordered = sorted(buckets.items(), key=lambda item: item[0])
+    base = metric.removesuffix("_bucket")
+    sum_delta = counter_delta(start, end, base + "_sum")
+    count_delta = counter_delta(start, end, base + "_count")
+    non_monotonic = []
+    previous = 0.0
+    for upper, count in ordered:
+        if count < previous:
+            non_monotonic.append("+Inf" if math.isinf(upper) else str(upper))
+        previous = count
+    bucket_count = ordered[-1][1] if ordered else 0.0
+    count_matches = math.isclose(
+        bucket_count,
+        float(count_delta["delta"]),
+        rel_tol=0,
+        abs_tol=1e-9,
+    )
+    valid = bool(
+        not decreases
+        and not missing
+        and not non_monotonic
+        and sum_delta["valid"]
+        and count_delta["valid"]
+        and count_matches
+    )
     return {
         "buckets": [
             {"le": "+Inf" if math.isinf(upper) else upper, "count": count}
             for upper, count in ordered
         ],
-        "valid": not decreases and not missing,
+        "sum": sum_delta,
+        "count": count_delta,
+        "valid": valid,
         "counter_decreases": decreases,
         "missing_end_series": missing,
+        "non_monotonic_buckets": non_monotonic,
+        "bucket_count_matches_count": count_matches,
     }
 
 
@@ -428,6 +470,94 @@ def target_ids(snapshot: dict[str, Any], job: str | None = None) -> set[str]:
     }
 
 
+def replica_ids(snapshot: dict[str, Any], service: str | None = None) -> set[str]:
+    return {
+        f"{item.get('service')}|{item.get('name')}|{item.get('container_id')}"
+        for item in snapshot.get("replicas", [])
+        if service is None or item.get("service") == service
+    }
+
+
+def boundary_errors(snapshot: dict[str, Any]) -> list[str]:
+    errors = []
+    boundary_after = snapshot.get("boundary_after")
+    sample_time = snapshot.get("sample_time_min")
+    if boundary_after is not None:
+        boundary_epoch = parse_time(boundary_after)
+        if boundary_epoch is None or sample_time is None:
+            errors.append("boundary sample timestamp missing")
+        elif float(sample_time) <= boundary_epoch.timestamp():
+            errors.append("boundary sample is not newer than requested boundary")
+    targets = snapshot.get("targets", [])
+    for target in targets:
+        if target.get("health") != "up" or target.get("last_error"):
+            errors.append(f"target not up: {target.get('job')}|{target.get('instance')}")
+    if "replicas" in snapshot:
+        target_counts: dict[str, int] = {}
+        for target in targets:
+            target_counts[target.get("job")] = target_counts.get(target.get("job"), 0) + 1
+        service_jobs = {
+            "api": "taskforge-api",
+            "worker": "taskforge-worker",
+            "scheduler": "taskforge-scheduler",
+        }
+        replicas = snapshot.get("replicas", [])
+        for service, job in service_jobs.items():
+            service_replicas = [item for item in replicas if item.get("service") == service]
+            if len(service_replicas) != target_counts.get(job, 0):
+                errors.append(
+                    f"target/replica count mismatch for {service}: "
+                    f"targets={target_counts.get(job, 0)} replicas={len(service_replicas)}"
+                )
+            for replica in service_replicas:
+                if replica.get("state") != "running":
+                    errors.append(f"replica not running: {service}|{replica.get('name')}")
+    return errors
+
+
+def process_identity_changes(start: dict[str, Any], end: dict[str, Any]) -> dict[str, list[str]]:
+    before = _series_values(start, IDENTITY_METRICS[0])
+    after = _series_values(end, IDENTITY_METRICS[0])
+    expected_start = {
+        target
+        for target in target_ids(start)
+        if target.startswith(("taskforge-worker|", "taskforge-scheduler|"))
+    }
+    expected_end = {
+        target
+        for target in target_ids(end)
+        if target.startswith(("taskforge-worker|", "taskforge-scheduler|"))
+    }
+    observed_start = {
+        f"{row.get('metric', {}).get('job')}|{row.get('metric', {}).get('instance')}"
+        for row in _sample_rows(start, IDENTITY_METRICS[0])
+    }
+    observed_end = {
+        f"{row.get('metric', {}).get('job')}|{row.get('metric', {}).get('instance')}"
+        for row in _sample_rows(end, IDENTITY_METRICS[0])
+    }
+    return {
+        "restarted": sorted(
+            key
+            for key in set(before) & set(after)
+            if not math.isclose(before[key], after[key], rel_tol=0, abs_tol=1e-9)
+        ),
+        "missing": sorted(set(before) - set(after)),
+        "new": sorted(set(after) - set(before)),
+        "unobserved_start_targets": sorted(expected_start - observed_start),
+        "unobserved_end_targets": sorted(expected_end - observed_end),
+    }
+
+
+def delta_quantiles(delta: dict[str, Any]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for percentile, fraction in ((50, 0.50), (95, 0.95), (99, 0.99)):
+        estimate, bucket = histogram_quantile(delta, fraction)
+        values[f"p{percentile}"] = estimate
+        values[f"p{percentile}_bucket"] = bucket
+    return values
+
+
 def build_reconciliation(
     raw: dict[str, Any],
     start: dict[str, Any],
@@ -439,19 +569,31 @@ def build_reconciliation(
     start_targets = target_ids(start)
     end_targets = target_ids(end)
     worker_churn = target_ids(start, "taskforge-worker") != target_ids(end, "taskforge-worker")
+    identities = process_identity_changes(start, end)
+    process_churn = any(identities.values())
+    start_replica_ids = replica_ids(start)
+    end_replica_ids = replica_ids(end)
+    replica_churn = start_replica_ids != end_replica_ids
+    start_boundary_errors = boundary_errors(start)
+    end_boundary_errors = boundary_errors(end)
     stable_target_churn = (
         target_ids(start, "taskforge-api") != target_ids(end, "taskforge-api")
         or target_ids(start, "taskforge-scheduler") != target_ids(end, "taskforge-scheduler")
-        or (worker_churn and not intentional_worker_churn)
+        or worker_churn
+        or process_churn
+        or replica_churn
+        or bool(start_boundary_errors)
+        or bool(end_boundary_errors)
     )
     counters: dict[str, Any] = {}
 
     expected_counters: dict[str, int] = {}
-    if scenario != "api_throughput" and not intentional_worker_churn:
+    if scenario != "api_throughput":
         expected_counters["claimed"] = int(raw.get("attempt_count", 0))
         expected_counters["completed"] = int(raw.get("attempt_count", 0)) - int(
             raw.get("attempt_status_counts", {}).get("ABANDONED", 0)
         )
+        expected_counters["attempts"] = int(raw.get("attempt_count", 0))
     if scenario == "retry_storm":
         expected_counters["retries_scheduled"] = int(
             raw.get("attempt_status_counts", {}).get("FAILED", 0)
@@ -480,7 +622,7 @@ def build_reconciliation(
 
     histograms: dict[str, Any] = {}
     histogram_specs: list[tuple[str, str, str, int]] = []
-    if scenario != "api_throughput" and not intentional_worker_churn:
+    if scenario != "api_throughput":
         histogram_specs.extend(
             [
                 ("queue", "queue_p95_seconds", "queue_observations", 95),
@@ -488,13 +630,16 @@ def build_reconciliation(
             ]
         )
         claim_delta = histogram_delta(start, end, HISTOGRAM_METRICS["claim"])
-        claim_estimate, claim_bucket = histogram_quantile(claim_delta, 0.95)
+        claim_quantiles = delta_quantiles(claim_delta)
+        claim_estimate = claim_quantiles["p95"]
+        claim_bucket = claim_quantiles["p95_bucket"]
         claim_observations = (
             float(claim_delta["buckets"][-1]["count"]) if claim_delta.get("buckets") else 0.0
         )
         expected_claims = int(raw.get("attempt_count", 0))
         histograms["claim"] = {
             **claim_delta,
+            "prometheus_quantiles": claim_quantiles,
             "raw": None,
             "prometheus": claim_estimate,
             "raw_expected_observations": expected_claims,
@@ -517,7 +662,9 @@ def build_reconciliation(
         )
     for name, raw_key, count_key, quantile in histogram_specs:
         delta = histogram_delta(start, end, HISTOGRAM_METRICS[name])
-        estimate, bucket = histogram_quantile(delta, quantile / 100)
+        quantiles = delta_quantiles(delta)
+        estimate = quantiles[f"p{quantile}"]
+        bucket = quantiles[f"p{quantile}_bucket"]
         raw_value = raw.get(raw_key)
         observation_count = float(delta["buckets"][-1]["count"]) if delta.get("buckets") else 0.0
         expected_observations = int(raw.get(count_key, 0))
@@ -537,6 +684,7 @@ def build_reconciliation(
         )
         histograms[name] = {
             **delta,
+            "prometheus_quantiles": quantiles,
             "raw": raw_value,
             "prometheus": estimate,
             "absolute_difference": None
@@ -563,6 +711,12 @@ def build_reconciliation(
         "intentional_worker_churn": intentional_worker_churn,
         "worker_target_churn": worker_churn,
         "unexpected_target_churn": stable_target_churn,
+        "process_identity_changes": identities,
+        "replica_churn": replica_churn,
+        "start_replicas": sorted(start_replica_ids),
+        "end_replicas": sorted(end_replica_ids),
+        "start_boundary_errors": start_boundary_errors,
+        "end_boundary_errors": end_boundary_errors,
         "start_targets": sorted(start_targets),
         "end_targets": sorted(end_targets),
         "counters": counters,
@@ -702,97 +856,317 @@ def aggregate(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summaries
 
 
+REQUIRED_TRIAL_ARTIFACTS = {
+    "metadata.json",
+    "tasks.csv",
+    "attempts.csv",
+    "correctness.json",
+    "prometheus_start.json",
+    "prometheus_end.json",
+    "prometheus_reconciliation.json",
+    "summary.json",
+    "manifest.json",
+}
+REQUIRED_IMAGE_SERVICES = {"api", "worker", "scheduler", "load_generator"}
+REGRESSION_CATEGORIES = {"api_integration", "worker", "scheduler", "benchmark_harness"}
+
+
+def _trial_name(item: dict[str, Any]) -> str:
+    return f"{item.get('scenario')}/{item.get('variant')}/t{item.get('trial')}"
+
+
+def _trial_directory(
+    output_dir: pathlib.Path, item: dict[str, Any]
+) -> tuple[pathlib.Path | None, str | None]:
+    relative = item.get("artifacts", {}).get("directory")
+    if not isinstance(relative, str) or not relative:
+        return None, "artifact directory is not recorded"
+    root = output_dir.resolve()
+    candidate = (output_dir / relative).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None, "artifact directory escapes the run directory"
+    return candidate, None
+
+
+def _read_json(path: pathlib.Path) -> dict[str, Any]:
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    return value
+
+
+def _json_equivalent(left: Any, right: Any) -> bool:
+    return json.dumps(left, sort_keys=True, separators=(",", ":")) == json.dumps(
+        right, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _int_value(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _correctness_errors(
+    item: dict[str, Any], tasks: list[dict[str, str]], attempts: list[dict[str, str]]
+) -> list[str]:
+    check = item.get("correctness", {})
+    errors = []
+    expected_tasks = _int_value(check.get("expected_tasks"))
+    actual_tasks = _int_value(check.get("actual_tasks"))
+    expected_attempts = _int_value(check.get("expected_attempts"))
+    actual_attempts = _int_value(check.get("actual_attempts"))
+    if check.get("passed") is not True:
+        errors.append("correctness result is not passed")
+    if expected_tasks is None or actual_tasks != expected_tasks or len(tasks) != expected_tasks:
+        errors.append("expected, recorded, and raw task counts do not match")
+    if (
+        expected_attempts is None
+        or actual_attempts != expected_attempts
+        or len(attempts) != expected_attempts
+    ):
+        errors.append("expected, recorded, and raw attempt counts do not match")
+
+    task_ids = [row.get("task_id", "") for row in tasks]
+    if not all(task_ids) or len(task_ids) != len(set(task_ids)):
+        errors.append("raw tasks contain missing or duplicate task ids")
+    attempt_keys = [(row.get("task_id", ""), row.get("attempt_number", "")) for row in attempts]
+    if not all(all(key) for key in attempt_keys) or len(attempt_keys) != len(set(attempt_keys)):
+        errors.append("raw attempts contain duplicate or incomplete attempt identities")
+    if any(task_id not in set(task_ids) for task_id, _ in attempt_keys):
+        errors.append("raw attempt references a task outside the trial")
+    for task in tasks:
+        count = sum(row.get("task_id") == task.get("task_id") for row in attempts)
+        if _int_value(task.get("attempt_count")) != count:
+            errors.append(f"task {task.get('task_id')} attempt_count does not match raw attempts")
+
+    zero_fields = (
+        "duplicate_attempts",
+        "attempt_count_mismatches",
+        "stranded_leases",
+        "unexpected_attempt_states",
+        "missing_queue_evidence",
+        "negative_queue_waits",
+    )
+    for field in zero_fields:
+        if _int_value(check.get(field)) != 0:
+            errors.append(f"{field} is not zero")
+    if _int_value(check.get("abandoned_attempts")) != _int_value(check.get("expected_abandoned")):
+        errors.append("abandoned attempt count does not match the scenario expectation")
+
+    terminal_expected = check.get("terminal_expected")
+    if terminal_expected is True:
+        if _int_value(check.get("terminal_tasks")) != expected_tasks:
+            errors.append("not every expected task is terminal")
+        if _int_value(check.get("succeeded_tasks")) != expected_tasks:
+            errors.append("not every expected task succeeded")
+        if any(row.get("final_status") != "SUCCEEDED" for row in tasks):
+            errors.append("raw tasks include a failed or non-terminal task")
+    elif terminal_expected is False:
+        if _int_value(check.get("queued_tasks")) != expected_tasks:
+            errors.append("submission scenario did not retain every expected queued task")
+        if _int_value(check.get("terminal_tasks")) != 0:
+            errors.append("submission scenario unexpectedly contains terminal tasks")
+    else:
+        errors.append("terminal expectation is not recorded")
+    return errors
+
+
+def _prometheus_errors(reconciliation: dict[str, Any]) -> list[str]:
+    errors = []
+    if reconciliation.get("prometheus_valid") is not True:
+        errors.append("prometheus_valid is not true")
+    if reconciliation.get("status") != "PASS":
+        errors.append("reconciliation status is not PASS")
+    if reconciliation.get("unexpected_target_churn") is not False:
+        errors.append("unexpected target or process churn was detected")
+    if reconciliation.get("replica_churn") is not False:
+        errors.append("replica churn was detected")
+    if reconciliation.get("start_boundary_errors") or reconciliation.get("end_boundary_errors"):
+        errors.append("Prometheus boundary errors were recorded")
+    identities = reconciliation.get("process_identity_changes", {})
+    if not isinstance(identities, dict) or any(identities.values()):
+        errors.append("target process identities changed or were not fully observed")
+    if reconciliation.get("start_targets") != reconciliation.get("end_targets"):
+        errors.append("start and end target sets differ")
+    if reconciliation.get("start_replicas") != reconciliation.get("end_replicas"):
+        errors.append("start and end replica sets differ")
+    for name, counter in reconciliation.get("counters", {}).items():
+        if (
+            counter.get("valid") is not True
+            or counter.get("status") != "PASS"
+            or not same_measurement(counter.get("difference"), 0)
+            or not same_measurement(counter.get("raw"), counter.get("prometheus"))
+        ):
+            errors.append(f"counter {name} does not exactly reconcile")
+    for name, histogram in reconciliation.get("histograms", {}).items():
+        if (
+            histogram.get("valid") is not True
+            or histogram.get("status") != "PASS"
+            or histogram.get("bucket_count_matches_count") is not True
+            or histogram.get("non_monotonic_buckets")
+            or histogram.get("sum", {}).get("valid") is not True
+            or histogram.get("count", {}).get("valid") is not True
+            or not same_measurement(
+                histogram.get("raw_expected_observations"),
+                histogram.get("prometheus_observations"),
+            )
+        ):
+            errors.append(f"histogram {name} delta is invalid")
+    return errors
+
+
+def _regression_category(record: dict[str, Any]) -> str | None:
+    command = " ".join(str(value) for value in record.get("command", []))
+    inferred = None
+    if "integration-tests" in command or "api/tests" in command:
+        inferred = "api_integration"
+    elif "/worker" in command or "worker/" in command:
+        inferred = "worker"
+    elif "/scheduler" in command or "scheduler/" in command:
+        inferred = "scheduler"
+    elif "benchmarks.tests" in command or "benchmarks/loadgen" in command:
+        inferred = "benchmark_harness"
+    recorded = record.get("category")
+    return inferred if recorded in (None, inferred) else None
+
+
 def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[str, Any]:
+    """Evaluate an existing run directory without executing benchmark work."""
     results = document.get("results", [])
     public = [item for item in results if item.get("classification") == "PUBLIC"]
     profile = document.get("profile", {})
     minimum_trials = int(profile.get("minimum_public_trials", 3))
     required_blocks = int(profile.get("required_blocks", 3))
-    cv_threshold = float(profile.get("trial_cv_threshold", 0.10))
-    drift_threshold = float(profile.get("between_block_drift_threshold", 0.10))
 
-    provenance_ok = bool(
-        document.get("publishable")
-        and document.get("source", {}).get("clean") is True
-        and document.get("source", {}).get("git_commit_sha")
-        and document.get("source", {}).get("git_tree_hash")
-        and document.get("images")
-        and all(item.get("image_id") for item in document.get("images", {}).values())
-        and document.get("environment")
-        and document.get("harness", {}).get("version")
-        and document.get("harness", {}).get("files")
-        and public
-        and all(
-            item.get("provenance", {}).get("source", {}).get("git_commit_sha")
-            == document.get("source", {}).get("git_commit_sha")
-            and item.get("provenance", {}).get("machine")
-            and item.get("configuration")
-            and item.get("workers") is not None
-            and item.get("schedulers") is not None
-            and item.get("count") is not None
-            and item.get("task_type")
-            for item in public
-        )
-    )
-    correctness_ok = bool(public) and all(
-        item.get("correctness", {}).get("passed") for item in public
-    )
+    source_errors = []
+    source = document.get("source", {})
+    if document.get("publishable") is not True:
+        source_errors.append("run is not marked publishable")
+    if source.get("clean") is not True:
+        source_errors.append("source tree is not clean")
+    for field in ("git_commit_sha", "git_tree_hash"):
+        if not source.get(field):
+            source_errors.append(f"source {field} is missing")
+    images = document.get("images", {})
+    for service in sorted(REQUIRED_IMAGE_SERVICES):
+        if not images.get(service, {}).get("image_id"):
+            source_errors.append(f"{service} image identity is missing")
+    if not document.get("environment"):
+        source_errors.append("environment provenance is missing")
+    if not document.get("harness", {}).get("version") or not document.get("harness", {}).get(
+        "files"
+    ):
+        source_errors.append("benchmark harness identity is incomplete")
+    if not public:
+        source_errors.append("run contains no PUBLIC trial")
+
     raw_errors = []
-    for item in public:
-        artifact_dir = output_dir / item.get("artifacts", {}).get("directory", "")
-        verified, errors = verify_manifest(artifact_dir)
+    latency_failures = []
+    correctness_failures = []
+    prometheus_failures = []
+    for item in results:
+        name = _trial_name(item)
+        if item.get("classification") not in {"PUBLIC", "EXPLORATORY"}:
+            raw_errors.append(f"{name}: classification must be PUBLIC or EXPLORATORY")
+        artifact_dir, directory_error = _trial_directory(output_dir, item)
+        if directory_error:
+            raw_errors.append(f"{name}: {directory_error}")
+            source_errors.append(f"{name}: {directory_error}")
+            continue
+        assert artifact_dir is not None
+        missing = sorted(
+            artifact
+            for artifact in REQUIRED_TRIAL_ARTIFACTS
+            if not (artifact_dir / artifact).is_file()
+        )
+        raw_errors.extend(f"{name}: {artifact} missing" for artifact in missing)
+        verified, manifest_errors = verify_manifest(artifact_dir)
         if not verified:
-            raw_errors.extend(
-                f"{item.get('scenario')}/{item.get('variant')}: {error}" for error in errors
+            errors = [f"{name}: {error}" for error in manifest_errors]
+            raw_errors.extend(errors)
+            source_errors.extend(errors)
+        if missing:
+            continue
+        try:
+            tasks = read_csv(artifact_dir / "tasks.csv")
+            attempts = read_csv(artifact_dir / "attempts.csv")
+            metadata = _read_json(artifact_dir / "metadata.json")
+            saved_correctness = _read_json(artifact_dir / "correctness.json")
+            start = _read_json(artifact_dir / "prometheus_start.json")
+            end = _read_json(artifact_dir / "prometheus_end.json")
+            saved_reconciliation = _read_json(artifact_dir / "prometheus_reconciliation.json")
+            saved_summary = _read_json(artifact_dir / "summary.json")
+            recalculated = derive_raw(tasks, attempts)
+        except (OSError, ValueError, KeyError, AssertionError, json.JSONDecodeError) as exc:
+            raw_errors.append(f"{name}: artifact parsing failed: {exc}")
+            continue
+
+        if not _json_equivalent(saved_correctness, item.get("correctness")):
+            correctness_failures.append(f"{name}: indexed correctness differs from artifact")
+        if not _json_equivalent(saved_reconciliation, item.get("prometheus_reconciliation")):
+            prometheus_failures.append(f"{name}: indexed reconciliation differs from artifact")
+        for field in ("scenario", "variant", "classification", "block", "trial"):
+            if metadata.get(field) != item.get(field):
+                raw_errors.append(f"{name}: metadata {field} identity mismatch")
+        for key, value in recalculated.items():
+            if not same_measurement(value, item.get("raw", {}).get(key)):
+                latency_failures.append(f"{name}: indexed raw {key} mismatch")
+            if not same_measurement(value, saved_summary.get("raw", {}).get(key)):
+                latency_failures.append(f"{name}: summary raw {key} mismatch")
+        if recalculated.get("missing_queue_evidence", 0):
+            latency_failures.append(f"{name}: immutable queue-entry evidence is missing")
+        for duration, count in recalculated.get("negative_durations", {}).items():
+            if count:
+                latency_failures.append(f"{name}: negative {duration} duration")
+
+        correctness_failures.extend(
+            f"{name}: {error}" for error in _correctness_errors(item, tasks, attempts)
+        )
+        intentional = bool(metadata.get("intentional_worker_churn", False))
+        rebuilt_reconciliation = build_reconciliation(
+            recalculated,
+            start,
+            end,
+            str(item.get("scenario")),
+            intentional_worker_churn=intentional,
+        )
+        if not _json_equivalent(rebuilt_reconciliation, saved_reconciliation):
+            prometheus_failures.append(
+                f"{name}: reconciliation does not reproduce from boundary snapshots"
             )
-        for name in ("tasks.csv", "attempts.csv", "summary.json"):
-            if not (artifact_dir / name).exists():
-                raw_errors.append(f"{item.get('scenario')}/{item.get('variant')}: {name} missing")
-        if all(
-            (artifact_dir / name).exists() for name in ("tasks.csv", "attempts.csv", "summary.json")
+        prometheus_failures.extend(
+            f"{name}: {error}" for error in _prometheus_errors(saved_reconciliation)
+        )
+
+        trial_source = item.get("provenance", {}).get("source", {})
+        if (
+            trial_source.get("git_commit_sha") != source.get("git_commit_sha")
+            or trial_source.get("git_tree_hash") != source.get("git_tree_hash")
+            or trial_source.get("clean") is not True
         ):
-            recalculated = derive_raw(
-                read_csv(artifact_dir / "tasks.csv"),
-                read_csv(artifact_dir / "attempts.csv"),
-            )
-            saved_summary = json.loads((artifact_dir / "summary.json").read_text()).get("raw", {})
-            for key, value in recalculated.items():
-                if not same_measurement(value, item.get("raw", {}).get(key)):
-                    raw_errors.append(
-                        f"{item.get('scenario')}/{item.get('variant')}: indexed raw {key} mismatch"
-                    )
-                if not same_measurement(value, saved_summary.get(key)):
-                    raw_errors.append(
-                        f"{item.get('scenario')}/{item.get('variant')}: summary raw {key} mismatch"
-                    )
-    raw_ok = (
-        bool(public)
-        and not raw_errors
-        and document.get("artifact_reproducibility", {}).get("passed") is True
-    )
+            source_errors.append(f"{name}: trial source provenance does not match the run")
+        if item.get("provenance", {}).get("images") != images:
+            source_errors.append(f"{name}: trial image provenance does not match the run")
+        if not item.get("provenance", {}).get("machine") or not item.get("configuration"):
+            source_errors.append(f"{name}: trial machine/configuration provenance is incomplete")
+        for field in ("workers", "schedulers", "count", "task_type"):
+            if item.get(field) is None:
+                source_errors.append(f"{name}: trial {field} configuration is missing")
+
     if document.get("artifact_reproducibility", {}).get("passed") is not True:
         raw_errors.append("report/plot regeneration was not verified")
-    latency_failures = [
-        f"{item['scenario']}/{item['variant']}/t{item.get('trial')}"
-        for item in public
-        if item.get("raw", {}).get("missing_queue_evidence", 0)
-        or any(item.get("raw", {}).get("negative_durations", {}).values())
-    ]
-    latency_ok = not latency_failures
-    prometheus_failures = [
-        f"{item['scenario']}/{item['variant']}/t{item.get('trial')}"
-        for item in public
-        if item.get("prometheus_reconciliation", {}).get("status") != "PASS"
-    ]
-    prometheus_ok = bool(public) and not prometheus_failures
 
     public_groups: dict[tuple[str, str], int] = {}
     for item in public:
-        public_groups[(item["scenario"], item["variant"])] = (
-            public_groups.get((item["scenario"], item["variant"]), 0) + 1
-        )
+        if item.get("valid") is True:
+            key = (item["scenario"], item["variant"])
+            public_groups[key] = public_groups.get(key, 0) + 1
     repetition_failures = [
-        f"{scenario}/{variant}={count}<{minimum_trials}"
+        f"{scenario}/{variant}={count}<{minimum_trials} valid PUBLIC trials"
         for (scenario, variant), count in public_groups.items()
         if count < minimum_trials
     ]
@@ -822,59 +1196,155 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
         f"{scenario}/{variant}=missing"
         for scenario, variant in sorted(required_groups - set(public_groups))
     )
-    repetition_ok = bool(public_groups) and not repetition_failures
 
-    summaries = aggregate(results)
     reproducibility_failures = []
-    for summary in summaries:
-        if summary.get("scenario") not in CORE_SCALING_SCENARIOS:
+    block_events = document.get("run_blocks", [])
+    blocks = {event.get("block"): event for event in block_events}
+    if len(blocks) != len(block_events):
+        reproducibility_failures.append("run block identities are missing or duplicated")
+    scaling_public = [item for item in public if item.get("scenario") in CORE_SCALING_SCENARIOS]
+    for (scenario, variant), _ in public_groups.items():
+        if scenario not in CORE_SCALING_SCENARIOS:
             continue
-        if int(summary.get("blocks", 0)) < required_blocks:
+        group = [
+            item
+            for item in scaling_public
+            if item.get("scenario") == scenario and item.get("variant") == variant
+        ]
+        group_blocks = {item.get("block") for item in group}
+        if len(group_blocks) < required_blocks:
             reproducibility_failures.append(
-                f"{summary['scenario']}/{summary['variant']} blocks={summary.get('blocks')}"
+                f"{scenario}/{variant} has {len(group_blocks)}<{required_blocks} independent blocks"
             )
-        if (summary.get("throughput_cv") or 0) > cv_threshold:
+        reset_boundaries = {blocks.get(block, {}).get("reset_started_at") for block in group_blocks}
+        if None in reset_boundaries or len(reset_boundaries) != len(group_blocks):
             reproducibility_failures.append(
-                f"{summary['scenario']}/{summary['variant']} cv={summary['throughput_cv']:.3f}"
+                f"{scenario}/{variant} does not have distinct recorded reset boundaries"
             )
-        if (summary.get("between_block_drift") or 0) > drift_threshold:
-            reproducibility_failures.append(
-                f"{summary['scenario']}/{summary['variant']} drift={summary['between_block_drift']:.3f}"
+        for item in group:
+            event = blocks.get(item.get("block"))
+            if not event or event.get("fresh_environment") is not True:
+                reproducibility_failures.append(
+                    f"{_trial_name(item)}: fresh block reset is not recorded"
+                )
+            elif not event.get("reset_started_at") or not event.get("ready_at"):
+                reproducibility_failures.append(
+                    f"{_trial_name(item)}: block reset boundary is incomplete"
+                )
+            elif event.get("warmup", {}).get("excluded") is not True or not event.get(
+                "warmup", {}
+            ).get("source"):
+                reproducibility_failures.append(
+                    f"{_trial_name(item)}: excluded block warmup is not recorded"
+                )
+            if item.get("order_index") is None:
+                reproducibility_failures.append(
+                    f"{_trial_name(item)}: execution order is not recorded"
+                )
+    if not scaling_public:
+        reproducibility_failures.append("no PUBLIC scaling trial has independent-block evidence")
+
+    regression = document.get("regression", {})
+    regression_failures = []
+    records = regression.get("commands", [])
+    if regression.get("passed") is not True:
+        regression_failures.append("regression suite is not marked passed")
+    categories: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        category = _regression_category(record)
+        if category:
+            categories.setdefault(category, []).append(record)
+        if record.get("exit_code") != 0:
+            regression_failures.append(
+                f"recorded regression command failed: {record.get('command')}"
             )
-    reproducibility_ok = (
-        bool([item for item in summaries if item.get("scenario") in CORE_SCALING_SCENARIOS])
-        and not reproducibility_failures
-    )
-    regression_ok = document.get("regression", {}).get("passed") is True
+    for category in sorted(REGRESSION_CATEGORIES - set(categories)):
+        regression_failures.append(f"{category} regression evidence is missing")
+    for category in ("worker", "scheduler"):
+        if category in categories and not any(
+            "-race" in [str(value) for value in record.get("command", [])]
+            for record in categories[category]
+        ):
+            regression_failures.append(f"{category} Go race regression evidence is missing")
 
     gates = {
-        "source_provenance": {"result": "PASS" if provenance_ok else "FAIL"},
-        "correctness": {"result": "PASS" if correctness_ok else "FAIL"},
+        "source_provenance": {
+            "result": "PASS" if not source_errors else "FAIL",
+            "errors": source_errors,
+        },
+        "correctness": {
+            "result": "PASS" if results and not correctness_failures else "FAIL",
+            "failures": correctness_failures,
+        },
         "raw_data": {
-            "result": "PASS" if raw_ok else "FAIL",
+            "result": "PASS" if results and not raw_errors else "FAIL",
             "errors": raw_errors,
         },
         "latency": {
-            "result": "PASS" if latency_ok else "FAIL",
+            "result": "PASS" if results and not latency_failures else "FAIL",
             "failures": latency_failures,
         },
         "prometheus": {
-            "result": "PASS" if prometheus_ok else "FAIL",
+            "result": "PASS" if results and not prometheus_failures else "FAIL",
             "failures": prometheus_failures,
         },
         "repetition": {
-            "result": "PASS" if repetition_ok else "FAIL",
+            "result": "PASS" if public_groups and not repetition_failures else "FAIL",
             "failures": repetition_failures,
+            "minimum_public_trials": minimum_trials,
         },
         "reproducibility": {
-            "result": "PASS" if reproducibility_ok else "FAIL",
+            "result": "PASS" if not reproducibility_failures else "FAIL",
             "failures": reproducibility_failures,
-            "trial_cv_threshold": cv_threshold,
-            "between_block_drift_threshold": drift_threshold,
+            "required_independent_blocks": required_blocks,
         },
-        "regression": {"result": "PASS" if regression_ok else "FAIL"},
+        "regression": {
+            "result": "PASS" if not regression_failures else "FAIL",
+            "failures": regression_failures,
+            "required_categories": sorted(REGRESSION_CATEGORIES),
+        },
     }
     gates["overall"] = {
         "result": "PASS" if all(value["result"] == "PASS" for value in gates.values()) else "FAIL"
     }
     return gates
+
+
+def evaluate_run_directory(run_directory: pathlib.Path) -> dict[str, Any]:
+    """Load and evaluate an immutable benchmark run directory."""
+    results_path = run_directory / "results.json"
+    if not results_path.is_file():
+        return {
+            "overall": {"result": "FAIL"},
+            "input": {"result": "FAIL", "errors": ["results.json missing"]},
+        }
+    try:
+        document = _read_json(results_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "overall": {"result": "FAIL"},
+            "input": {"result": "FAIL", "errors": [f"results.json invalid: {exc}"]},
+        }
+    gates = evaluate_trust(document, run_directory)
+    verified, manifest_errors = verify_manifest(run_directory)
+    if not verified:
+        source_gate = gates["source_provenance"]
+        source_gate["result"] = "FAIL"
+        source_gate.setdefault("errors", []).extend(
+            f"run manifest: {error}" for error in manifest_errors
+        )
+        gates["overall"]["result"] = "FAIL"
+    return gates
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Evaluate an existing TF-012 run directory")
+    parser.add_argument("run_directory", type=pathlib.Path)
+    arguments = parser.parse_args()
+    gates = evaluate_run_directory(arguments.run_directory)
+    print(json.dumps(gates, indent=2, sort_keys=True))
+    return 0 if gates.get("overall", {}).get("result") == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
