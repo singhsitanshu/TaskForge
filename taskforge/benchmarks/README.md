@@ -59,9 +59,15 @@ Each timestamped directory contains:
 - `manifest.json`: top-level SHA-256 inventory of the complete result bundle.
 
 Raw quantiles use archived timestamps and documented type-7 interpolation.
-Prometheus histogram quantiles use per-series start/end bucket deltas and are
-allowed only when the raw value lies in the corresponding observed bucket.
-Neither source is silently substituted for the other.
+Prometheus histogram quantiles use per-series start/end bucket deltas. A
+percentile is bucket-reconciled only when the raw timestamps and histogram
+measure the same semantic interval. Queue, retry-lateness, and recovery-lag
+meet that requirement. Claim duration has no raw timestamp pair, and execution
+does not: the immutable database attempt interval spans claim and completion
+work, while `taskforge_task_execution_duration_seconds` times only the handler.
+Those operational histograms therefore require valid structure, stable targets,
+and an exact observation count but are not compared to a different raw
+percentile. Neither source is silently substituted for the other.
 
 The TF-012E2 command is fixed to `test.sleep` with `duration_ms=50`, workers
 1/4/8/16, three reset blocks, and 1,000 tasks per configuration by default. It

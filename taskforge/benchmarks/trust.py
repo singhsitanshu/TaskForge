@@ -13,7 +13,7 @@ import statistics
 from collections.abc import Iterable
 from typing import Any
 
-HARNESS_VERSION = "TF-012D/1"
+HARNESS_VERSION = "TF-012D/2"
 QUANTILE_METHOD = "linear interpolation at index (n - 1) * q (Hyndman-Fan type 7)"
 PUBLIC_SCENARIOS = {
     "noop_scaling",
@@ -565,6 +565,7 @@ def build_reconciliation(
     scenario: str,
     *,
     intentional_worker_churn: bool = False,
+    legacy_execution_percentile: bool = False,
 ) -> dict[str, Any]:
     start_targets = target_ids(start)
     end_targets = target_ids(end)
@@ -626,7 +627,6 @@ def build_reconciliation(
         histogram_specs.extend(
             [
                 ("queue", "queue_p95_seconds", "queue_observations", 95),
-                ("execution", "execution_p95_seconds", "execution_observations", 95),
             ]
         )
         claim_delta = histogram_delta(start, end, HISTOGRAM_METRICS["claim"])
@@ -652,6 +652,41 @@ def build_reconciliation(
             else "FAIL",
             "note": "Operational-only histogram; PostgreSQL has no claim-transaction timestamp pair.",
         }
+        if legacy_execution_percentile:
+            histogram_specs.append(
+                ("execution", "execution_p95_seconds", "execution_observations", 95)
+            )
+        else:
+            execution_delta = histogram_delta(start, end, HISTOGRAM_METRICS["execution"])
+            execution_quantiles = delta_quantiles(execution_delta)
+            execution_observations = (
+                float(execution_delta["buckets"][-1]["count"])
+                if execution_delta.get("buckets")
+                else 0.0
+            )
+            expected_executions = int(raw.get("execution_observations", 0))
+            histograms["execution"] = {
+                **execution_delta,
+                "prometheus_quantiles": execution_quantiles,
+                "raw": None,
+                "prometheus": execution_quantiles["p95"],
+                "database_attempt_p95_seconds": raw.get("execution_p95_seconds"),
+                "raw_expected_observations": expected_executions,
+                "prometheus_observations": execution_observations,
+                "raw_bucket": None,
+                "status": "PASS"
+                if execution_delta["valid"]
+                and not stable_target_churn
+                and execution_observations == expected_executions
+                else "FAIL",
+                "note": (
+                    "Count-and-structure reconciliation only: the worker histogram times "
+                    "handler invocation with Go's monotonic clock, while the immutable "
+                    "database attempt interval spans claim and completion work using "
+                    "PostgreSQL wall-clock timestamps. Their percentiles are not "
+                    "semantically comparable."
+                ),
+            }
     if scenario == "retry_storm":
         histogram_specs.append(
             ("retry_lateness", "retry_lateness_p95_seconds", "retry_lateness_observations", 95)
@@ -1041,6 +1076,8 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
     profile = document.get("profile", {})
     minimum_trials = int(profile.get("minimum_public_trials", 3))
     required_blocks = int(profile.get("required_blocks", 3))
+    harness_version = str(document.get("harness", {}).get("version", ""))
+    legacy_execution_percentile = harness_version.startswith("TF-012D/1")
 
     source_errors = []
     source = document.get("source", {})
@@ -1133,6 +1170,7 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             end,
             str(item.get("scenario")),
             intentional_worker_churn=intentional,
+            legacy_execution_percentile=legacy_execution_percentile,
         )
         if not _json_equivalent(rebuilt_reconciliation, saved_reconciliation):
             prometheus_failures.append(

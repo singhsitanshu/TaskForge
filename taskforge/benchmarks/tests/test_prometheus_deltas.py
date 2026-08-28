@@ -9,6 +9,7 @@ from benchmarks.trust import (
     counter_delta,
     delta_quantiles,
     histogram_delta,
+    histogram_quantile,
 )
 
 
@@ -33,17 +34,11 @@ def add_histogram_pair(start, end, metric, observations, *, job, instance):
         ("0.05", observations * 0.95),
         ("+Inf", observations),
     )
-    for (upper, start_value), (_, increment) in zip(
-        start_counts, increments, strict=True
-    ):
+    for (upper, start_value), (_, increment) in zip(start_counts, increments, strict=True):
         add_counter(start, metric, start_value, job=job, instance=instance, le=upper)
-        add_counter(
-            end, metric, start_value + increment, job=job, instance=instance, le=upper
-        )
+        add_counter(end, metric, start_value + increment, job=job, instance=instance, le=upper)
     add_counter(start, base + "_sum", 100, job=job, instance=instance)
-    add_counter(
-        end, base + "_sum", 100 + observations * 0.03, job=job, instance=instance
-    )
+    add_counter(end, base + "_sum", 100 + observations * 0.03, job=job, instance=instance)
     add_counter(start, base + "_count", 1000, job=job, instance=instance)
     add_counter(end, base + "_count", 1000 + observations, job=job, instance=instance)
 
@@ -220,6 +215,16 @@ def snapshots(*, attempts: int, retries: bool = False):
 
 
 class PrometheusDeltaTests(unittest.TestCase):
+    @staticmethod
+    def boundary_delta(value: float, observations: int = 100):
+        return {
+            "buckets": [
+                {"le": 0.01, "count": observations if value <= 0.01 else 0},
+                {"le": 0.05, "count": observations if value <= 0.05 else 0},
+                {"le": "+Inf", "count": observations},
+            ]
+        }
+
     def test_histogram_components_are_captured(self):
         for bucket in HISTOGRAM_METRICS.values():
             base = bucket.removesuffix("_bucket")
@@ -252,6 +257,78 @@ class PrometheusDeltaTests(unittest.TestCase):
         self.assertAlmostEqual(quantiles["p95"], 0.05)
         self.assertAlmostEqual(quantiles["p99"], 0.05)
 
+    def test_histogram_quantile_just_below_10ms_uses_first_bucket(self):
+        delta = self.boundary_delta(0.009999)
+        for fraction, estimate in ((0.50, 0.005), (0.95, 0.0095), (0.99, 0.0099)):
+            measured, bucket = histogram_quantile(delta, fraction)
+            self.assertAlmostEqual(measured, estimate)
+            self.assertEqual(bucket, (0.0, 0.01))
+
+    def test_histogram_quantile_exactly_10ms_uses_inclusive_first_bucket(self):
+        delta = self.boundary_delta(0.01)
+        for fraction, estimate in ((0.50, 0.005), (0.95, 0.0095), (0.99, 0.0099)):
+            measured, bucket = histogram_quantile(delta, fraction)
+            self.assertAlmostEqual(measured, estimate)
+            self.assertEqual(bucket, (0.0, 0.01))
+
+    def test_histogram_quantile_just_above_10ms_uses_next_bucket(self):
+        delta = self.boundary_delta(0.010001)
+        for fraction, estimate in ((0.50, 0.03), (0.95, 0.048), (0.99, 0.0496)):
+            measured, bucket = histogram_quantile(delta, fraction)
+            self.assertAlmostEqual(measured, estimate)
+            self.assertEqual(bucket, (0.01, 0.05))
+
+    def test_execution_reconciliation_does_not_compare_different_intervals(self):
+        start, end = snapshots(attempts=100)
+        raw = {
+            "attempt_count": 100,
+            "attempt_status_counts": {"SUCCEEDED": 100},
+            "queue_observations": 100,
+            "queue_p95_seconds": 0.05,
+            "execution_observations": 100,
+            "execution_p95_seconds": 0.051,
+        }
+        reconciliation = build_reconciliation(raw, start, end, "cpu_scaling")
+        execution = reconciliation["histograms"]["execution"]
+        self.assertEqual(execution["status"], "PASS")
+        self.assertIsNone(execution["raw"])
+        self.assertIsNone(execution["raw_bucket"])
+        self.assertEqual(execution["database_attempt_p95_seconds"], 0.051)
+        self.assertEqual(execution["prometheus_observations"], 100)
+        self.assertIn("not semantically comparable", execution["note"])
+
+    def test_execution_reconciliation_still_requires_exact_observation_count(self):
+        start, end = snapshots(attempts=99)
+        raw = {
+            "attempt_count": 100,
+            "attempt_status_counts": {"SUCCEEDED": 100},
+            "queue_observations": 99,
+            "queue_p95_seconds": 0.05,
+            "execution_observations": 100,
+            "execution_p95_seconds": 0.051,
+        }
+        reconciliation = build_reconciliation(raw, start, end, "cpu_scaling")
+        self.assertEqual(reconciliation["histograms"]["execution"]["status"], "FAIL")
+
+    def test_legacy_execution_reconciliation_reproduces_old_method(self):
+        start, end = snapshots(attempts=100)
+        raw = {
+            "attempt_count": 100,
+            "attempt_status_counts": {"SUCCEEDED": 100},
+            "queue_observations": 100,
+            "queue_p95_seconds": 0.05,
+            "execution_observations": 100,
+            "execution_p95_seconds": 0.051,
+        }
+        reconciliation = build_reconciliation(
+            raw,
+            start,
+            end,
+            "cpu_scaling",
+            legacy_execution_percentile=True,
+        )
+        self.assertEqual(reconciliation["histograms"]["execution"]["status"], "FAIL")
+
     def test_100_successful_tasks_reconcile(self):
         start, end = snapshots(attempts=100)
         raw = {
@@ -283,12 +360,8 @@ class PrometheusDeltaTests(unittest.TestCase):
         reconciliation = build_reconciliation(raw, start, end, "retry_storm")
         self.assertTrue(reconciliation["prometheus_valid"])
         self.assertEqual(reconciliation["counters"]["attempts"]["prometheus"], 200)
-        self.assertEqual(
-            reconciliation["counters"]["retries_scheduled"]["prometheus"], 100
-        )
-        self.assertEqual(
-            reconciliation["counters"]["retry_promotions"]["prometheus"], 100
-        )
+        self.assertEqual(reconciliation["counters"]["retries_scheduled"]["prometheus"], 100)
+        self.assertEqual(reconciliation["counters"]["retry_promotions"]["prometheus"], 100)
 
     def test_worker_restart_cannot_look_valid(self):
         start, end = snapshots(attempts=100)
