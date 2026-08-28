@@ -137,6 +137,48 @@ def artifact_hashes(paths: list[pathlib.Path]) -> dict[str, str]:
     return {path.relative_to(common).as_posix(): sha256_file(path) for path in paths}
 
 
+def load_trusted_scaling_comparison(
+    results_path: pathlib.Path,
+    *,
+    ticket: str,
+    scenario: str,
+    workers: tuple[int, ...] = (1, 4, 8, 16),
+) -> dict[str, Any]:
+    """Validate an external trusted scaling run and return its speedup shape."""
+    if results_path.name != "results.json" or not results_path.is_file():
+        raise BenchmarkError("comparison input must identify an existing results.json")
+    trust = evaluate_run_directory(results_path.parent)
+    if trust.get("overall", {}).get("result") != "PASS":
+        raise BenchmarkError(f"{ticket} comparison artifact does not pass the trust evaluator")
+    document = json.loads(results_path.read_text())
+    if document.get("tf_ticket") != ticket:
+        raise BenchmarkError(f"comparison artifact is not a {ticket} run")
+    summaries = {
+        int(str(item.get("variant", ""))[1:]): item
+        for item in aggregate(document.get("results", []))
+        if item.get("scenario") == scenario
+        and str(item.get("variant", "")).startswith("w")
+        and str(item.get("variant", ""))[1:].isdigit()
+    }
+    if sorted(summaries) != list(workers):
+        raise BenchmarkError(
+            f"trusted {ticket} comparison does not contain workers "
+            + ",".join(str(value) for value in workers)
+        )
+    speedup = {str(value): summaries[value].get("speedup_vs_w1") for value in workers}
+    if any(value is None for value in speedup.values()):
+        raise BenchmarkError(f"trusted {ticket} comparison is missing scaling speedup")
+    return {
+        "run_id": document.get("run_id"),
+        "commit": document.get("source", {}).get("git_commit_sha"),
+        "tree": document.get("source", {}).get("git_tree_hash"),
+        "results_sha256": sha256_file(results_path),
+        "trust": "PASS",
+        "scenario": scenario,
+        "speedup": speedup,
+    }
+
+
 def run_scoped_experiment(
     arguments: Any,
     specification: ScopedExperiment,

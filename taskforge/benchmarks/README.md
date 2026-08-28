@@ -69,6 +69,17 @@ requires an external trusted TF-012E1 `results.json` for the mechanically derive
 no-op speedup comparison. `python3 -m benchmarks.e2 --dry-run` prints the scoped
 contract without starting Docker or executing tasks.
 
+The TF-012E3 command is fixed to deterministic `test.cpu` with `200000` SHA-256
+iterations, workers 1/4/8/16, three reset blocks, and 1,000 tasks per
+configuration by default. It requires external trusted TF-012E1 and TF-012E2
+`results.json` files and compares scaling shape without modifying either input.
+`python3 -m benchmarks.e3 --dry-run` prints the CPU-only contract without
+starting Docker or executing tasks. A future trusted run uses:
+
+```text
+make benchmark-tf012e3 E1_RESULTS=benchmarks/results/<trusted-e1-run>/results.json E2_RESULTS=benchmarks/results/<trusted-e2-run>/results.json
+```
+
 ## Publication policy
 
 PUBLIC configurations need at least three valid trials. Headline scaling uses
