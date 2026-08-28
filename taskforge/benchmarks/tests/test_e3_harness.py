@@ -18,8 +18,15 @@ from benchmarks.e3 import (
     load_trusted_e1,
     load_trusted_e2,
 )
-from benchmarks.e3_artifacts import PLOT_NAMES, generate, render_report, resource_rows
-from benchmarks.run import BenchmarkError
+from benchmarks.e3_artifacts import (
+    PLOT_NAMES,
+    e3_latency_rows,
+    generate,
+    plot_specs,
+    render_report,
+    resource_rows,
+)
+from benchmarks.run import BENCHMARKS, BenchmarkError
 from benchmarks.scoped import run_scaling_blocks
 
 
@@ -44,9 +51,12 @@ def synthetic_document() -> dict[str, object]:
                 },
                 **{
                     f"{name}_p{quantile}_seconds": (workers / 1000 + quantile / 1_000_000)
-                    for name in ("queue", "execution", "total")
+                    for name in ("queue", "total")
                     for quantile in (50, 95, 99)
                 },
+                "execution_p50_seconds": 0.010,
+                "execution_p95_seconds": 0.015,
+                "execution_p99_seconds": 0.020,
             }
             counters = {
                 name: {"raw": 1000, "prometheus": 1000, "difference": 0, "status": "PASS"}
@@ -86,7 +96,14 @@ def synthetic_document() -> dict[str, object]:
                                     "p95": 0.002,
                                     "p99": 0.003,
                                 }
-                            }
+                            },
+                            "execution": {
+                                "prometheus_quantiles": {
+                                    "p50": 0.035,
+                                    "p95": 0.045,
+                                    "p99": 0.049,
+                                }
+                            },
                         },
                     },
                 }
@@ -213,8 +230,68 @@ class E3ContractTests(unittest.TestCase):
         self.assertIn("iterations per attempt: `200000`", report)
         self.assertIn("CPU Resource Behavior", report)
         self.assertIn("E1 / E2 / E3 Speedup Comparison", report)
+        self.assertIn("Attempt Lifecycle p95", report)
+        self.assertIn("Handler p50", report)
+        self.assertIn("Handler p95", report)
+        self.assertNotIn("| Execution p95 |", report)
         self.assertNotIn("API Re-Test", report)
         self.assertNotIn("Recovery", report)
+
+    def test_e3_latency_model_keeps_attempt_and_handler_sources_distinct(self) -> None:
+        rows = e3_latency_rows(synthetic_document())
+        self.assertEqual([row["attempt_lifecycle_p95"] for row in rows], [0.015] * 4)
+        self.assertEqual([row["handler_p95"] for row in rows], [0.045] * 4)
+
+    def test_plot_04_uses_handler_p95_not_attempt_lifecycle_p95(self) -> None:
+        specs = plot_specs(synthetic_document())
+        name, title, _, series = specs[3]
+        self.assertEqual(name, PLOT_NAMES[3])
+        self.assertEqual(title, "CPU Handler-Execution p95 vs Workers")
+        self.assertEqual(series[0][0], "Prometheus handler execution")
+        self.assertEqual([value for _, value in series[0][1]], [0.045] * 4)
+        self.assertNotEqual([value for _, value in series[0][1]], [0.015] * 4)
+
+    def test_throughput_and_speedup_plot_sources_remain_unchanged(self) -> None:
+        specs = plot_specs(synthetic_document())
+        self.assertEqual(specs[0][1:3], ("CPU processing throughput", "Tasks/second"))
+        self.assertEqual(specs[1][1:3], ("CPU speedup", "Speedup vs 1 worker"))
+        self.assertEqual(specs[4][1], "Trusted E1 vs E2 vs E3 speedup")
+        self.assertEqual([name for name, _ in specs[4][3]], ["E1 no-op", "E2 50 ms", "E3 CPU"])
+
+    def test_retained_trusted_e3_uses_recorded_handler_histogram(self) -> None:
+        results_path = (
+            BENCHMARKS
+            / "results"
+            / "20260828T070013621798Z_e76b95f98246_tf-012e3-cpu_57f885b840a0"
+            / "results.json"
+        )
+        if not results_path.is_file():
+            self.skipTest("retained trusted E3 result is not available")
+        document = json.loads(results_path.read_text())
+        row = next(item for item in e3_latency_rows(document) if item["workers"] == 8)
+        plotted = dict(plot_specs(document)[3][3][0][1])[8]
+        self.assertAlmostEqual(row["attempt_lifecycle_p95"], 0.01469225)
+        self.assertAlmostEqual(row["handler_p95"], 0.04621212121212121)
+        self.assertAlmostEqual(plotted, row["handler_p95"])
+        self.assertNotAlmostEqual(plotted, row["attempt_lifecycle_p95"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            regenerated_results = Path(temporary) / "results.json"
+            regenerated_results.write_text(results_path.read_text())
+            generate(regenerated_results, None)
+            retained_plots = results_path.parent / "plots"
+            regenerated_plots = regenerated_results.parent / "plots"
+            for index in (0, 1, 2, 4):
+                name = PLOT_NAMES[index]
+                self.assertEqual(
+                    (regenerated_plots / name).read_bytes(),
+                    (retained_plots / name).read_bytes(),
+                    name,
+                )
+            new_plot = (regenerated_plots / PLOT_NAMES[3]).read_bytes()
+            self.assertIn("CPU Handler-Execution p95 vs Workers", new_plot.decode())
+            self.assertIn("Prometheus handler execution", new_plot.decode())
+            self.assertNotIn("CPU Attempt-Execution p95 vs Workers", new_plot.decode())
 
     def test_plot_generator_writes_only_five_deterministic_e3_plots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

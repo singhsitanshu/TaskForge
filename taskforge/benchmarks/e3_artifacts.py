@@ -9,7 +9,6 @@ import pathlib
 from typing import Any
 
 from benchmarks.e1_artifacts import (
-    latency_rows,
     markdown_table,
     median_measurement,
     number,
@@ -49,10 +48,87 @@ def resource_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def e3_latency_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep PostgreSQL attempt lifecycle and Prometheus handler timing distinct."""
+    results = valid_results(document, SCENARIO)
+    rows = []
+    for workers in sorted({int(item["workers"]) for item in results}):
+        items = [item for item in results if int(item["workers"]) == workers]
+        row: dict[str, Any] = {"workers": workers}
+        for quantile in ("p50", "p95", "p99"):
+            row[f"queue_{quantile}"] = median_measurement(
+                items, ("raw", f"queue_{quantile}_seconds")
+            )
+            row[f"attempt_lifecycle_{quantile}"] = median_measurement(
+                items, ("raw", f"execution_{quantile}_seconds")
+            )
+            row[f"total_{quantile}"] = median_measurement(
+                items, ("raw", f"total_{quantile}_seconds")
+            )
+            row[f"handler_{quantile}"] = median_measurement(
+                items,
+                (
+                    "prometheus_reconciliation",
+                    "histograms",
+                    "execution",
+                    "prometheus_quantiles",
+                    quantile,
+                ),
+            )
+            row[f"claim_{quantile}"] = median_measurement(
+                items,
+                (
+                    "prometheus_reconciliation",
+                    "histograms",
+                    "claim",
+                    "prometheus_quantiles",
+                    quantile,
+                ),
+            )
+        rows.append(row)
+    return rows
+
+
+def plot_specs(document: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
+    """Return the five deterministic E3 plots with explicit latency semantics."""
+    results = valid_results(document, SCENARIO)
+    summaries = summary_rows(document, SCENARIO)
+    latencies = e3_latency_rows(document)
+    throughput = grouped(results, SCENARIO, "workers", "raw.processing_throughput_per_second")
+    cpu_speedup = [(row["workers"], row["speedup"]) for row in summaries]
+    efficiency = [(row["workers"], row["parallel_efficiency"]) for row in summaries]
+    handler_p95 = [(row["workers"], row["handler_p95"]) for row in latencies]
+    e1_speedup = [
+        (workers, float(document.get("e1_comparison", {}).get("speedup", {})[str(workers)]))
+        for workers in (1, 4, 8, 16)
+    ]
+    e2_speedup = [
+        (workers, float(document.get("e2_comparison", {}).get("speedup", {})[str(workers)]))
+        for workers in (1, 4, 8, 16)
+    ]
+    return (
+        (PLOT_NAMES[0], "CPU processing throughput", "Tasks/second", [("CPU", throughput)]),
+        (PLOT_NAMES[1], "CPU speedup", "Speedup vs 1 worker", [("CPU", cpu_speedup)]),
+        (PLOT_NAMES[2], "CPU parallel efficiency", "Efficiency", [("CPU", efficiency)]),
+        (
+            PLOT_NAMES[3],
+            "CPU Handler-Execution p95 vs Workers",
+            "Seconds",
+            [("Prometheus handler execution", handler_p95)],
+        ),
+        (
+            PLOT_NAMES[4],
+            "Trusted E1 vs E2 vs E3 speedup",
+            "Speedup vs 1 worker",
+            [("E1 no-op", e1_speedup), ("E2 50 ms", e2_speedup), ("E3 CPU", cpu_speedup)],
+        ),
+    )
+
+
 def render_report(document: dict[str, Any], artifact_prefix: str = "") -> str:
     results = valid_results(document, SCENARIO)
     summaries = summary_rows(document, SCENARIO)
-    latencies = latency_rows(document, SCENARIO)
+    latencies = e3_latency_rows(document)
     resources = resource_rows(document)
     source = document.get("source", {})
     environment = document.get("environment", {}) or {}
@@ -78,14 +154,23 @@ def render_report(document: dict[str, Any], artifact_prefix: str = "") -> str:
         ],
     )
     latency_table = markdown_table(
-        ["Workers", "Queue p95", "Claim p95*", "Execution p50", "Execution p95", "Total p95"],
+        [
+            "Workers",
+            "Queue p95",
+            "Attempt Lifecycle p95",
+            "Handler p50",
+            "Handler p95",
+            "Claim p95",
+            "Total p95",
+        ],
         [
             [
                 str(row["workers"]),
                 number(row["queue_p95"]),
+                number(row["attempt_lifecycle_p95"]),
+                number(row["handler_p50"]),
+                number(row["handler_p95"]),
                 number(row["claim_p95"]),
-                number(row["execution_p50"]),
-                number(row["execution_p95"]),
                 number(row["total_p95"]),
             ]
             for row in latencies
@@ -204,7 +289,9 @@ Worker counts are 1, 4, 8, and 16 across three independently reset blocks. Every
 
 ## Latency
 
-Values are seconds. Claim p95 marked `*` is secondary Prometheus delta-histogram evidence.
+Values are seconds. Attempt Lifecycle is immutable PostgreSQL `finished_at - started_at`
+evidence. Handler and Claim values are separate Prometheus trial-delta histogram
+estimates; neither is a validation of the attempt-lifecycle percentile.
 
 {latency_table}
 
@@ -259,38 +346,11 @@ def generate(
     results_path: pathlib.Path, report_path: pathlib.Path | None = None
 ) -> list[pathlib.Path]:
     document = json.loads(results_path.read_text())
-    results = valid_results(document, SCENARIO)
-    summaries = summary_rows(document, SCENARIO)
-    latencies = latency_rows(document, SCENARIO)
     output_dir = results_path.parent
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
-    throughput = grouped(results, SCENARIO, "workers", "raw.processing_throughput_per_second")
-    cpu_speedup = [(row["workers"], row["speedup"]) for row in summaries]
-    efficiency = [(row["workers"], row["parallel_efficiency"]) for row in summaries]
-    execution_p95 = [(row["workers"], row["execution_p95"]) for row in latencies]
-    e1_speedup = [
-        (workers, float(document.get("e1_comparison", {}).get("speedup", {})[str(workers)]))
-        for workers in (1, 4, 8, 16)
-    ]
-    e2_speedup = [
-        (workers, float(document.get("e2_comparison", {}).get("speedup", {})[str(workers)]))
-        for workers in (1, 4, 8, 16)
-    ]
-    specs = (
-        (PLOT_NAMES[0], "CPU processing throughput", "Tasks/second", [("CPU", throughput)]),
-        (PLOT_NAMES[1], "CPU speedup", "Speedup vs 1 worker", [("CPU", cpu_speedup)]),
-        (PLOT_NAMES[2], "CPU parallel efficiency", "Efficiency", [("CPU", efficiency)]),
-        (PLOT_NAMES[3], "CPU execution p95", "Seconds", [("CPU", execution_p95)]),
-        (
-            PLOT_NAMES[4],
-            "Trusted E1 vs E2 vs E3 speedup",
-            "Speedup vs 1 worker",
-            [("E1 no-op", e1_speedup), ("E2 50 ms", e2_speedup), ("E3 CPU", cpu_speedup)],
-        ),
-    )
     generated = []
-    for name, title, y_label, series in specs:
+    for name, title, y_label, series in plot_specs(document):
         path = plots_dir / name
         line_plot(path, title, "Workers", y_label, series)
         generated.append(path)
