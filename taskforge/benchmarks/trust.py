@@ -19,14 +19,18 @@ PUBLIC_SCENARIOS = {
     "noop_scaling",
     "io50_scaling",
     "cpu_scaling",
+    "api_submission",
     "api_throughput",
     "arrival_saturation",
     "retry_storm",
     "recovery_storm",
 }
 CORE_SCALING_SCENARIOS = {"noop_scaling", "io50_scaling", "cpu_scaling"}
+API_SUBMISSION_SCENARIOS = {"api_submission", "api_throughput"}
 
 COUNTER_METRICS = {
+    "api_requests": "taskforge_api_requests_total",
+    "api_submissions": "taskforge_task_submissions_total",
     "claimed": "taskforge_worker_tasks_claimed_total",
     "completed": "taskforge_worker_tasks_completed_total",
     "attempts": "taskforge_task_attempts_total",
@@ -39,6 +43,7 @@ HISTOGRAM_METRICS = {
     "claim": "taskforge_worker_claim_duration_seconds_bucket",
     "execution": "taskforge_task_execution_duration_seconds_bucket",
     "retry_lateness": "taskforge_retry_lateness_seconds_bucket",
+    "retry_batch": "taskforge_scheduler_retry_batch_duration_seconds_bucket",
     "recovery": "taskforge_recovery_lag_seconds_bucket",
 }
 HISTOGRAM_COMPONENT_METRICS = tuple(
@@ -228,6 +233,109 @@ def derive_raw(tasks: list[dict[str, str]], attempts: list[dict[str, str]]) -> d
     return raw
 
 
+def derive_retry_raw(tasks: list[dict[str, str]], attempts: list[dict[str, str]]) -> dict[str, Any]:
+    """Extend immutable lifecycle evidence with attempt-2-only queue timing."""
+    raw = derive_raw(tasks, attempts)
+    attempt2_queue: list[float] = []
+    missing_attempt2_queue_evidence = 0
+    negative_attempt2_queue = 0
+    for attempt in attempts:
+        if int(attempt.get("attempt_number") or 0) != 2:
+            continue
+        started = attempt.get("attempt_started_at")
+        queue_entered = attempt.get("queue_entered_at")
+        if not started or not queue_entered:
+            missing_attempt2_queue_evidence += 1
+            continue
+        value = seconds_between(started, queue_entered)
+        assert value is not None
+        attempt2_queue.append(value)
+        negative_attempt2_queue += int(value < 0)
+    raw["attempt2_queue_observations"] = len(attempt2_queue)
+    raw["missing_attempt2_queue_evidence"] = missing_attempt2_queue_evidence
+    raw["negative_durations"]["attempt2_queue_wait"] = negative_attempt2_queue
+    raw.update(quantiles("attempt2_queue", attempt2_queue))
+    return raw
+
+
+def retry_history_evidence(
+    tasks: list[dict[str, str]], attempts: list[dict[str, str]], expected_tasks: int
+) -> dict[str, Any]:
+    """Summarize the exact fail-once-then-succeed durable attempt contract."""
+    attempt1 = [row for row in attempts if row.get("attempt_number") == "1"]
+    attempt2 = [row for row in attempts if row.get("attempt_number") == "2"]
+    attempt_numbers = {row.get("attempt_number") for row in attempts}
+    task_ids = {row.get("task_id") for row in tasks}
+    attempts_by_task: dict[str | None, list[dict[str, str]]] = {}
+    for attempt in attempts:
+        attempts_by_task.setdefault(attempt.get("task_id"), []).append(attempt)
+
+    retry_schedules = sum(bool(row.get("retry_scheduled_at")) for row in attempt1)
+    retry_promotions = 0
+    retry_chain_mismatches = 0
+    for task_id in task_ids:
+        rows = attempts_by_task.get(task_id, [])
+        by_number = {row.get("attempt_number"): row for row in rows}
+        first = by_number.get("1")
+        second = by_number.get("2")
+        exact_pair = len(rows) == 2 and set(by_number) == {"1", "2"}
+        exact_statuses = bool(
+            first
+            and second
+            and first.get("status") == "FAILED"
+            and second.get("status") == "SUCCEEDED"
+        )
+        schedule = parse_time(first.get("retry_scheduled_at")) if first else None
+        scheduled_snapshot = parse_time(second.get("scheduled_at_snapshot")) if second else None
+        queue_entered = parse_time(second.get("queue_entered_at")) if second else None
+        exact_promotion = bool(
+            schedule
+            and scheduled_snapshot
+            and queue_entered
+            and schedule == scheduled_snapshot
+            and queue_entered >= scheduled_snapshot
+        )
+        retry_promotions += int(exact_promotion)
+        retry_chain_mismatches += int(not (exact_pair and exact_statuses and exact_promotion))
+
+    orphan_attempt_tasks = len(set(attempts_by_task) - task_ids)
+    duplicate_identities = len(attempts) - len(
+        {(row.get("task_id"), row.get("attempt_number")) for row in attempts}
+    )
+    evidence = {
+        "retry_history_expected": True,
+        "expected_attempt1_failed": expected_tasks,
+        "attempt1_failed": sum(row.get("status") == "FAILED" for row in attempt1),
+        "expected_attempt2_succeeded": expected_tasks,
+        "attempt2_succeeded": sum(row.get("status") == "SUCCEEDED" for row in attempt2),
+        "expected_retry_schedules": expected_tasks,
+        "retry_schedules": retry_schedules,
+        "expected_retry_promotions": expected_tasks,
+        "retry_promotions": retry_promotions,
+        "retry_duplicate_identities": duplicate_identities,
+        "retry_chain_mismatches": retry_chain_mismatches,
+        "retry_orphan_attempt_tasks": orphan_attempt_tasks,
+        "retry_unexpected_attempt_numbers": sorted(
+            str(value) for value in attempt_numbers - {"1", "2"}
+        ),
+    }
+    evidence["retry_history_passed"] = bool(
+        len(tasks) == expected_tasks
+        and len(attempts) == expected_tasks * 2
+        and len(attempt1) == expected_tasks
+        and len(attempt2) == expected_tasks
+        and evidence["attempt1_failed"] == expected_tasks
+        and evidence["attempt2_succeeded"] == expected_tasks
+        and retry_schedules == expected_tasks
+        and retry_promotions == expected_tasks
+        and duplicate_identities == 0
+        and retry_chain_mismatches == 0
+        and orphan_attempt_tasks == 0
+        and not evidence["retry_unexpected_attempt_numbers"]
+    )
+    return evidence
+
+
 def write_csv(path: pathlib.Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
     with path.open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
@@ -328,16 +436,27 @@ def _series_key(row: dict[str, Any], *, omit: set[str] | None = None) -> str:
     return json.dumps(labels, sort_keys=True, separators=(",", ":"))
 
 
-def _series_values(snapshot: dict[str, Any], metric: str) -> dict[str, float]:
+def _series_values(
+    snapshot: dict[str, Any], metric: str, *, labels: dict[str, str] | None = None
+) -> dict[str, float]:
     values: dict[str, float] = {}
     for row in _sample_rows(snapshot, metric):
+        series_labels = row.get("metric", {})
+        if labels and any(series_labels.get(key) != value for key, value in labels.items()):
+            continue
         values[_series_key(row)] = float(row["value"][1])
     return values
 
 
-def counter_delta(start: dict[str, Any], end: dict[str, Any], metric: str) -> dict[str, Any]:
-    before = _series_values(start, metric)
-    after = _series_values(end, metric)
+def counter_delta(
+    start: dict[str, Any],
+    end: dict[str, Any],
+    metric: str,
+    *,
+    labels: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    before = _series_values(start, metric, labels=labels)
+    after = _series_values(end, metric, labels=labels)
     decreases = []
     missing = []
     total = 0.0
@@ -566,6 +685,7 @@ def build_reconciliation(
     *,
     intentional_worker_churn: bool = False,
     legacy_execution_percentile: bool = False,
+    require_retry_batch: bool = False,
 ) -> dict[str, Any]:
     start_targets = target_ids(start)
     end_targets = target_ids(end)
@@ -589,7 +709,17 @@ def build_reconciliation(
     counters: dict[str, Any] = {}
 
     expected_counters: dict[str, int] = {}
-    if scenario != "api_throughput":
+    counter_labels: dict[str, dict[str, str]] = {}
+    if scenario in API_SUBMISSION_SCENARIOS:
+        expected_counters["api_requests"] = int(raw.get("task_count", 0))
+        counter_labels["api_requests"] = {
+            "method": "POST",
+            "route": "/tasks",
+            "status_class": "2xx",
+        }
+        expected_counters["api_submissions"] = int(raw.get("task_count", 0))
+        counter_labels["api_submissions"] = {"outcome": "created"}
+    else:
         expected_counters["claimed"] = int(raw.get("attempt_count", 0))
         expected_counters["completed"] = int(raw.get("attempt_count", 0)) - int(
             raw.get("attempt_status_counts", {}).get("ABANDONED", 0)
@@ -606,7 +736,7 @@ def build_reconciliation(
         )
 
     for name, expected in expected_counters.items():
-        measured = counter_delta(start, end, COUNTER_METRICS[name])
+        measured = counter_delta(start, end, COUNTER_METRICS[name], labels=counter_labels.get(name))
         difference = measured["delta"] - expected
         measured.update(
             {
@@ -623,7 +753,7 @@ def build_reconciliation(
 
     histograms: dict[str, Any] = {}
     histogram_specs: list[tuple[str, str, str, int]] = []
-    if scenario != "api_throughput":
+    if scenario not in API_SUBMISSION_SCENARIOS:
         histogram_specs.extend(
             [
                 ("queue", "queue_p95_seconds", "queue_observations", 95),
@@ -734,6 +864,30 @@ def build_reconciliation(
             "status": status,
         }
 
+    if scenario == "retry_storm" and require_retry_batch:
+        retry_batch_delta = histogram_delta(start, end, HISTOGRAM_METRICS["retry_batch"])
+        retry_batch_quantiles = delta_quantiles(retry_batch_delta)
+        retry_batch_observations = (
+            float(retry_batch_delta["buckets"][-1]["count"])
+            if retry_batch_delta.get("buckets")
+            else 0.0
+        )
+        histograms["retry_batch"] = {
+            **retry_batch_delta,
+            "prometheus_quantiles": retry_batch_quantiles,
+            "raw": None,
+            "prometheus": retry_batch_quantiles["p95"],
+            "raw_expected_observations": None,
+            "prometheus_observations": retry_batch_observations,
+            "raw_bucket": None,
+            "status": "PASS"
+            if retry_batch_delta["valid"]
+            and not stable_target_churn
+            and retry_batch_observations > 0
+            else "FAIL",
+            "note": "Operational scheduler retry-batch histogram; no raw batch count exists.",
+        }
+
     required = [item["status"] for item in counters.values()] + [
         item["status"] for item in histograms.values()
     ]
@@ -769,7 +923,7 @@ def aggregate(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for (scenario, variant), items in groups.items():
         throughput_key = (
             "submission_throughput_per_second"
-            if scenario == "api_throughput"
+            if scenario in API_SUBMISSION_SCENARIOS
             else "processing_throughput_per_second"
         )
         values = [
@@ -806,7 +960,9 @@ def aggregate(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "classification": items[0].get("classification"),
                 "trials": len(items),
                 "blocks": len(block_medians),
-                "throughput_kind": "submission" if scenario == "api_throughput" else "processing",
+                "throughput_kind": "submission"
+                if scenario in API_SUBMISSION_SCENARIOS
+                else "processing",
                 "throughput_mean": mean,
                 "throughput_median": median_value,
                 "throughput_min": min(values) if values else None,
@@ -1007,6 +1163,37 @@ def _correctness_errors(
             errors.append("submission scenario unexpectedly contains terminal tasks")
     else:
         errors.append("terminal expectation is not recorded")
+
+    if item.get("scenario") == "api_submission":
+        submission = item.get("submission", {})
+        status_counts = submission.get("status_counts", {}) or {}
+        status_2xx = sum(
+            int(value) for status, value in status_counts.items() if str(status).startswith("2")
+        )
+        status_5xx = sum(
+            int(value) for status, value in status_counts.items() if str(status).startswith("5")
+        )
+        transport_errors = sum(
+            int(value) for value in (submission.get("error_counts", {}) or {}).values()
+        )
+        if (
+            _int_value(submission.get("request_count")) != expected_tasks
+            or _int_value(submission.get("successes")) != expected_tasks
+            or _int_value(submission.get("distinct_task_ids")) != expected_tasks
+            or status_2xx != expected_tasks
+            or status_5xx != 0
+            or transport_errors != 0
+            or expected_attempts != 0
+        ):
+            errors.append("API submission HTTP/task-row correctness contract failed")
+
+    if item.get("scenario") == "retry_storm" and check.get("retry_history_expected") is True:
+        evidence = retry_history_evidence(tasks, attempts, expected_tasks or 0)
+        if evidence.get("retry_history_passed") is not True:
+            errors.append("fail-once retry attempt history is invalid")
+        for field, value in evidence.items():
+            if check.get(field) != value:
+                errors.append(f"recorded retry history {field} does not match raw attempts")
     return errors
 
 
@@ -1045,9 +1232,12 @@ def _prometheus_errors(reconciliation: dict[str, Any]) -> list[str]:
             or histogram.get("non_monotonic_buckets")
             or histogram.get("sum", {}).get("valid") is not True
             or histogram.get("count", {}).get("valid") is not True
-            or not same_measurement(
-                histogram.get("raw_expected_observations"),
-                histogram.get("prometheus_observations"),
+            or (
+                histogram.get("raw_expected_observations") is not None
+                and not same_measurement(
+                    histogram.get("raw_expected_observations"),
+                    histogram.get("prometheus_observations"),
+                )
             )
         ):
             errors.append(f"histogram {name} delta is invalid")
@@ -1137,7 +1327,11 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             end = _read_json(artifact_dir / "prometheus_end.json")
             saved_reconciliation = _read_json(artifact_dir / "prometheus_reconciliation.json")
             saved_summary = _read_json(artifact_dir / "summary.json")
-            recalculated = derive_raw(tasks, attempts)
+            recalculated = (
+                derive_retry_raw(tasks, attempts)
+                if document.get("tf_ticket") == "TF-012E5" and item.get("scenario") == "retry_storm"
+                else derive_raw(tasks, attempts)
+            )
         except (OSError, ValueError, KeyError, AssertionError, json.JSONDecodeError) as exc:
             raw_errors.append(f"{name}: artifact parsing failed: {exc}")
             continue
@@ -1146,6 +1340,8 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             correctness_failures.append(f"{name}: indexed correctness differs from artifact")
         if not _json_equivalent(saved_reconciliation, item.get("prometheus_reconciliation")):
             prometheus_failures.append(f"{name}: indexed reconciliation differs from artifact")
+        if not _json_equivalent(saved_summary.get("submission"), item.get("submission")):
+            raw_errors.append(f"{name}: indexed submission differs from artifact")
         for field in ("scenario", "variant", "classification", "block", "trial"):
             if metadata.get(field) != item.get(field):
                 raw_errors.append(f"{name}: metadata {field} identity mismatch")
@@ -1171,6 +1367,7 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             str(item.get("scenario")),
             intentional_worker_churn=intentional,
             legacy_execution_percentile=legacy_execution_percentile,
+            require_retry_batch=document.get("tf_ticket") == "TF-012E5",
         )
         if not _json_equivalent(rebuilt_reconciliation, saved_reconciliation):
             prometheus_failures.append(
@@ -1217,10 +1414,9 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             required_groups.update(
                 (scenario, f"w{workers}") for workers in profile.get("scaling_workers", [])
             )
-    if "api_throughput" in required_scenarios:
+    for api_scenario in sorted(API_SUBMISSION_SCENARIOS & required_scenarios):
         required_groups.update(
-            ("api_throughput", f"c{concurrency}")
-            for concurrency in profile.get("api_concurrency", [])
+            (api_scenario, f"c{concurrency}") for concurrency in profile.get("api_concurrency", [])
         )
     if "arrival_saturation" in required_scenarios:
         required_groups.update(
@@ -1240,13 +1436,16 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
     blocks = {event.get("block"): event for event in block_events}
     if len(blocks) != len(block_events):
         reproducibility_failures.append("run block identities are missing or duplicated")
-    scaling_public = [item for item in public if item.get("scenario") in CORE_SCALING_SCENARIOS]
+    independent_scenarios = set(CORE_SCALING_SCENARIOS)
+    if document.get("tf_ticket") in {"TF-012E4", "TF-012E5"}:
+        independent_scenarios.update(required_scenarios)
+    independent_public = [item for item in public if item.get("scenario") in independent_scenarios]
     for (scenario, variant), _ in public_groups.items():
-        if scenario not in CORE_SCALING_SCENARIOS:
+        if scenario not in independent_scenarios:
             continue
         group = [
             item
-            for item in scaling_public
+            for item in independent_public
             if item.get("scenario") == scenario and item.get("variant") == variant
         ]
         group_blocks = {item.get("block") for item in group}
@@ -1279,8 +1478,8 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
                 reproducibility_failures.append(
                     f"{_trial_name(item)}: execution order is not recorded"
                 )
-    if not scaling_public:
-        reproducibility_failures.append("no PUBLIC scaling trial has independent-block evidence")
+    if not independent_public:
+        reproducibility_failures.append("no PUBLIC scoped trial has independent-block evidence")
 
     regression = document.get("regression", {})
     regression_failures = []

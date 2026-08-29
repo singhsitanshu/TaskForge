@@ -1,0 +1,20 @@
+{
+  "name": "tf-012e4-api",
+  "description": "Publishable TF-012E4 API-submission-only experiment.",
+  "minimum_public_trials": 3,
+  "required_blocks": 3,
+  "required_public_scenarios": ["api_submission"],
+  "random_seed": 120124,
+  "cooldown_seconds": 1,
+  "warmup_tasks": 100,
+  "api_requests": 2000,
+  "api_concurrency": [1, 10, 25, 50, 100],
+  "api_replicas": 1,
+  "api_submission_workers": 0,
+  "workload": {
+    "task_type": "test.noop",
+    "payload": {},
+    "key_mode": "none",
+    "max_attempts": 1
+  }
+}

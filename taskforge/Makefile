@@ -1,4 +1,4 @@
-.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-tf012e2 benchmark-tf012e3 benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
+.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-tf012e2 benchmark-tf012e3 benchmark-tf012e4 benchmark-tf012e5 benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
 
 build:
 	docker compose build
@@ -125,6 +125,12 @@ benchmark-tf012e3:
 	@test -n "$(E1_RESULTS)" || (printf 'usage: make benchmark-tf012e3 E1_RESULTS=benchmarks/results/<trusted-e1-run>/results.json E2_RESULTS=benchmarks/results/<trusted-e2-run>/results.json\n' && exit 2)
 	@test -n "$(E2_RESULTS)" || (printf 'usage: make benchmark-tf012e3 E1_RESULTS=benchmarks/results/<trusted-e1-run>/results.json E2_RESULTS=benchmarks/results/<trusted-e2-run>/results.json\n' && exit 2)
 	python3 -m benchmarks.e3 --project taskforge-tf012-e3-cpu --e1-results "$(E1_RESULTS)" --e2-results "$(E2_RESULTS)"
+
+benchmark-tf012e4:
+	python3 -m benchmarks.e4 --project taskforge-tf012-e4-api $(if $(filter 1 true TRUE,$(DRY_RUN)),--dry-run,)
+
+benchmark-tf012e5:
+	python3 -m benchmarks.e5 --project taskforge-tf012-e5-retry $(if $(filter 1 true TRUE,$(DRY_RUN)),--dry-run,)
 
 benchmark-dev:
 	@printf 'UNPUBLISHABLE development run: dirty source is permitted and recorded\n'

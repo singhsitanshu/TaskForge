@@ -53,6 +53,9 @@ class ScopedExperiment:
     focused_test_modules: tuple[str, ...]
 
 
+ExperimentExecutor = Callable[[TrustedRun, ScopedExperiment], None]
+
+
 def scoped_harness_identity(specification: ScopedExperiment) -> dict[str, Any]:
     identity = harness_identity()
     identity["version"] = f"{identity['version']}+{specification.ticket}"
@@ -186,6 +189,7 @@ def run_scoped_experiment(
     *,
     profile_overrides: dict[str, Any] | None = None,
     document_fields: dict[str, Any] | None = None,
+    execute_trials: ExperimentExecutor | None = None,
 ) -> int:
     contract = run_contract(development=False)
     source = contract["source"]
@@ -205,7 +209,12 @@ def run_scoped_experiment(
             "scenario": specification.scenario,
             "task_type": specification.task_type,
             "payload": specification.payload,
-            "workers": profile["scaling_workers"],
+            "workers": profile.get(
+                "scaling_workers",
+                profile.get("retry_workers", profile.get("api_submission_workers")),
+            ),
+            "schedulers": profile.get("retry_schedulers", 1),
+            "api_concurrency": profile.get("api_concurrency"),
             "blocks": profile["required_blocks"],
             "task_count": profile[specification.count_key],
         },
@@ -268,7 +277,7 @@ def run_scoped_experiment(
             },
         }
         trusted = TrustedRun(harness, output_dir, profile, run_id, trial_provenance)
-        run_scaling_blocks(trusted, specification)
+        (execute_trials or run_scaling_blocks)(trusted, specification)
         document["results"] = trusted.results
         document["run_blocks"] = trusted.block_events
         document["summaries"] = aggregate(trusted.results)

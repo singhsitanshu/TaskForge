@@ -54,8 +54,23 @@ def prometheus_snapshot(value: float) -> dict[str, Any]:
         },
     ]
     metrics: dict[str, list[dict[str, Any]]] = {}
-    for metric in COUNTER_METRICS.values():
-        metrics[metric] = [_sample({"job": "taskforge-worker", "instance": "worker:8080"}, value)]
+    for name, metric in COUNTER_METRICS.items():
+        labels = {"job": "taskforge-worker", "instance": "worker:8080"}
+        if name == "api_requests":
+            labels = {
+                "job": "taskforge-api",
+                "instance": "api:8000",
+                "method": "POST",
+                "route": "/tasks",
+                "status_class": "2xx",
+            }
+        elif name == "api_submissions":
+            labels = {
+                "job": "taskforge-api",
+                "instance": "api:8000",
+                "outcome": "created",
+            }
+        metrics[metric] = [_sample(labels, value)]
     for bucket_metric in HISTOGRAM_METRICS.values():
         base = bucket_metric.removesuffix("_bucket")
         labels = {"job": "taskforge-worker", "instance": "worker:8080"}

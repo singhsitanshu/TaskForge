@@ -19,6 +19,8 @@ required on the host: the load generator is built in Docker.
 make benchmark-trust-smoke
 make benchmark-release
 make benchmark-tf012e2 E1_RESULTS=benchmarks/results/<trusted-e1-run>/results.json
+make benchmark-tf012e4
+make benchmark-tf012e5
 ```
 
 Both trusted targets refuse a dirty working tree before building images or
@@ -84,6 +86,33 @@ starting Docker or executing tasks. A future trusted run uses:
 
 ```text
 make benchmark-tf012e3 E1_RESULTS=benchmarks/results/<trusted-e1-run>/results.json E2_RESULTS=benchmarks/results/<trusted-e2-run>/results.json
+```
+
+TF-012E4 is an API-submission-only path. It issues 2,000 normal keyless
+`POST /tasks` requests at concurrency 1/10/25/50/100 across three independently
+reset, randomized blocks. The measured window uses one API replica and zero task
+processing workers, so successful rows intentionally remain `QUEUED` with zero
+attempts. The scoped output is `tf-012e4-api-submission.md` plus exactly three
+plots for submission throughput, request p95, and request p99. Submission
+throughput is not worker processing throughput. Inspect the plan without Docker:
+
+```text
+make benchmark-tf012e4 DRY_RUN=1
+python3 -m benchmarks.e4 --dry-run
+```
+
+TF-012E5 is a retry-storm-only path. Each of three independent reset trials
+submits 1,000 `test.fail_n_then_succeed` tasks with `failures=1`, using 10 workers
+and 3 schedulers. The durable contract requires exactly one FAILED attempt 1 and
+one SUCCEEDED attempt 2 per task, with exact retry schedule/promotion counters
+and immutable retry-lateness evidence. It uses the committed benchmark retry
+configuration (100 ms base/max delay, zero jitter, 100 ms promotion interval).
+The scoped output is `tf-012e5-retry-storm.md` plus exactly four retry plots.
+Inspect the plan without Docker:
+
+```text
+make benchmark-tf012e5 DRY_RUN=1
+python3 -m benchmarks.e5 --dry-run
 ```
 
 ## Publication policy

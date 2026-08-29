@@ -37,7 +37,9 @@ from benchmarks.trust import (
     build_reconciliation,
     create_manifest,
     derive_raw,
+    derive_retry_raw,
     evaluate_trust,
+    retry_history_evidence,
     sha256_file,
     write_csv,
     write_json,
@@ -634,6 +636,69 @@ def trusted_correctness(
     return check
 
 
+def api_submission_correctness(
+    harness: Harness,
+    queue: str,
+    expected_requests: int,
+    submission: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a keyless API-only trial whose tasks intentionally remain queued."""
+    check = trusted_correctness(
+        harness, queue, expected_requests, 0, terminal=False, expected_abandoned=0
+    )
+    status_counts = submission.get("status_counts", {}) or {}
+    status_2xx = sum(
+        int(value) for status, value in status_counts.items() if str(status).startswith("2")
+    )
+    status_4xx = sum(
+        int(value) for status, value in status_counts.items() if str(status).startswith("4")
+    )
+    status_5xx = sum(
+        int(value) for status, value in status_counts.items() if str(status).startswith("5")
+    )
+    transport_errors = sum(
+        int(value) for value in (submission.get("error_counts", {}) or {}).values()
+    )
+    check.update(
+        {
+            "expected_http_requests": expected_requests,
+            "actual_http_requests": int(submission.get("request_count", 0)),
+            "successful_responses": int(submission.get("successes", 0)),
+            "distinct_response_task_ids": int(submission.get("distinct_task_ids", 0)),
+            "http_2xx": status_2xx,
+            "http_4xx": status_4xx,
+            "http_5xx": status_5xx,
+            "transport_errors": transport_errors,
+        }
+    )
+    check["passed"] = bool(
+        check["passed"]
+        and check["actual_http_requests"] == expected_requests
+        and check["successful_responses"] == expected_requests
+        and check["distinct_response_task_ids"] == expected_requests
+        and status_2xx == expected_requests
+        and status_4xx == 0
+        and status_5xx == 0
+        and transport_errors == 0
+    )
+    return check
+
+
+def retry_storm_correctness(
+    harness: Harness,
+    queue: str,
+    expected_tasks: int,
+    tasks: list[dict[str, str]],
+    attempts: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Validate the exact fail-once-then-succeed durable history."""
+    check = trusted_correctness(harness, queue, expected_tasks, expected_tasks * 2)
+    evidence = retry_history_evidence(tasks, attempts, expected_tasks)
+    check.update(evidence)
+    check["passed"] = bool(check["passed"] and evidence["retry_history_passed"])
+    return check
+
+
 class TrustedRun:
     def __init__(
         self,
@@ -805,6 +870,7 @@ class TrustedRun:
         timeout: float = 300,
         order_index: int | None = None,
         random_seed: int | None = None,
+        retry_history_contract: bool = False,
     ) -> dict[str, Any]:
         queue = f"tf012b-{scenario}-{variant}-b{block}-t{trial}"[:128]
         print(
@@ -831,10 +897,24 @@ class TrustedRun:
         trial_end = dt.datetime.now(dt.UTC)
         prom_end = finish_trial_snapshot(self.harness, workers, schedulers, trial_end)
         tasks, attempts = capture_rows(self.harness, queue)
-        raw = derive_raw(tasks, attempts)
+        raw = (
+            derive_retry_raw(tasks, attempts)
+            if retry_history_contract
+            else derive_raw(tasks, attempts)
+        )
         expected = count if expected_attempts is None else expected_attempts
-        correct = trusted_correctness(self.harness, queue, count, expected)
-        reconciliation = build_reconciliation(raw, prom_start, prom_end, scenario)
+        correct = (
+            retry_storm_correctness(self.harness, queue, count, tasks, attempts)
+            if retry_history_contract
+            else trusted_correctness(self.harness, queue, count, expected)
+        )
+        reconciliation = build_reconciliation(
+            raw,
+            prom_start,
+            prom_end,
+            scenario,
+            require_retry_batch=retry_history_contract,
+        )
         metadata = {
             "run_id": self.run_id,
             "scenario": scenario,
@@ -844,6 +924,7 @@ class TrustedRun:
             "trial": trial,
             "order_index": order_index,
             "random_seed": random_seed,
+            "retry_history_contract": retry_history_contract,
             "trial_start": trial_started.isoformat(),
             "trial_end": trial_end.isoformat(),
             "prometheus_start_sample_time": prom_start.get("sample_time_max"),
@@ -880,12 +961,25 @@ class TrustedRun:
             },
         )
 
-    def api_trial(self, concurrency: int, trial: int) -> dict[str, Any]:
-        scenario = "api_throughput"
+    def api_trial(
+        self,
+        concurrency: int,
+        trial: int,
+        *,
+        scenario: str = "api_throughput",
+        block: int | None = None,
+        order_index: int | None = None,
+        random_seed: int | None = None,
+        key_mode: str = "unique",
+    ) -> dict[str, Any]:
         variant = f"c{concurrency}"
         count = int(self.profile["api_requests"])
-        queue = f"tf012b-api-c{concurrency}-t{trial}"
-        print(f"[api] concurrency={concurrency} trial={trial}", flush=True)
+        block_number = trial if block is None else block
+        queue = f"tf012b-{scenario}-c{concurrency}-b{block_number}-t{trial}"[:128]
+        print(
+            f"[{scenario}] concurrency={concurrency} block={block_number} trial={trial}",
+            flush=True,
+        )
         host_before = self.host_state()
         prom_start = prepare_trial(self.harness, 0, 1)
         trial_started = dt.datetime.now(dt.UTC)
@@ -898,7 +992,7 @@ class TrustedRun:
                 payload="{}",
                 queue=queue,
                 max_attempts=1,
-                key_mode="unique",
+                key_mode=key_mode,
                 key_prefix=queue,
             )
         trial_end = dt.datetime.now(dt.UTC)
@@ -907,8 +1001,12 @@ class TrustedRun:
         raw = derive_raw(tasks, attempts)
         raw["submission_throughput_per_second"] = submission["requests_per_second"]
         raw["submission_latency_ms"] = submission.get("latency_ms", {})
-        correct = trusted_correctness(
-            self.harness, queue, count, 0, terminal=False, expected_abandoned=0
+        correct = (
+            api_submission_correctness(self.harness, queue, count, submission)
+            if scenario == "api_submission"
+            else trusted_correctness(
+                self.harness, queue, count, 0, terminal=False, expected_abandoned=0
+            )
         )
         reconciliation = build_reconciliation(raw, prom_start, prom_end, scenario)
         metadata = {
@@ -916,8 +1014,10 @@ class TrustedRun:
             "scenario": scenario,
             "variant": variant,
             "classification": "PUBLIC",
-            "block": trial,
+            "block": block_number,
             "trial": trial,
+            "order_index": order_index,
+            "random_seed": random_seed,
             "trial_start": trial_started.isoformat(),
             "trial_end": trial_end.isoformat(),
             "prometheus_start_sample_time": prom_start.get("sample_time_max"),
@@ -929,7 +1029,7 @@ class TrustedRun:
         return self.save_trial(
             scenario=scenario,
             variant=variant,
-            block=trial,
+            block=block_number,
             trial=trial,
             workers=0,
             schedulers=1,
@@ -947,7 +1047,12 @@ class TrustedRun:
             reconciliation=reconciliation,
             resource_samples=resources.samples,
             metadata=metadata,
-            extra={"api_concurrency": concurrency},
+            extra={
+                "api_concurrency": concurrency,
+                "order_index": order_index,
+                "random_seed": random_seed,
+                "submission_key_mode": key_mode,
+            },
         )
 
     def recovery_trial(self, trial: int) -> dict[str, Any]:

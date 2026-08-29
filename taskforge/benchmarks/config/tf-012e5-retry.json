@@ -1,0 +1,24 @@
+{
+  "name": "tf-012e5-retry",
+  "description": "Publishable TF-012E5 fail-once retry-storm experiment.",
+  "minimum_public_trials": 3,
+  "required_blocks": 3,
+  "required_public_scenarios": ["retry_storm"],
+  "random_seed": 120125,
+  "cooldown_seconds": 1,
+  "warmup_tasks": 100,
+  "retry_tasks": 1000,
+  "retry_workers": 10,
+  "retry_schedulers": 3,
+  "workload": {
+    "task_type": "test.fail_n_then_succeed",
+    "failures": 1,
+    "max_attempts": 2
+  },
+  "retry_configuration": {
+    "base_delay": "100ms",
+    "max_delay": "100ms",
+    "jitter": "0",
+    "promotion_interval": "100ms"
+  }
+}
