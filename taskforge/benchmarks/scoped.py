@@ -211,9 +211,12 @@ def run_scoped_experiment(
             "payload": specification.payload,
             "workers": profile.get(
                 "scaling_workers",
-                profile.get("retry_workers", profile.get("api_submission_workers")),
+                profile.get(
+                    "retry_workers",
+                    profile.get("recovery_workers", profile.get("api_submission_workers")),
+                ),
             ),
-            "schedulers": profile.get("retry_schedulers", 1),
+            "schedulers": profile.get("retry_schedulers", profile.get("recovery_schedulers", 1)),
             "api_concurrency": profile.get("api_concurrency"),
             "blocks": profile["required_blocks"],
             "task_count": profile[specification.count_key],

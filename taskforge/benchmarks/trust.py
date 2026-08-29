@@ -45,6 +45,7 @@ HISTOGRAM_METRICS = {
     "retry_lateness": "taskforge_retry_lateness_seconds_bucket",
     "retry_batch": "taskforge_scheduler_retry_batch_duration_seconds_bucket",
     "recovery": "taskforge_recovery_lag_seconds_bucket",
+    "recovery_batch": "taskforge_scheduler_recovery_batch_duration_seconds_bucket",
 }
 HISTOGRAM_COMPONENT_METRICS = tuple(
     component
@@ -256,6 +257,209 @@ def derive_retry_raw(tasks: list[dict[str, str]], attempts: list[dict[str, str]]
     raw["negative_durations"]["attempt2_queue_wait"] = negative_attempt2_queue
     raw.update(quantiles("attempt2_queue", attempt2_queue))
     return raw
+
+
+def derive_recovery_raw(
+    tasks: list[dict[str, str]],
+    attempts: list[dict[str, str]],
+    failure_boundary: dict[str, Any],
+) -> dict[str, Any]:
+    """Extend immutable lifecycle evidence with crash-boundary recovery timing."""
+    raw = derive_raw(tasks, attempts)
+    kill_time = parse_time(failure_boundary.get("kill_timestamp"))
+    completion_times = [
+        parsed
+        for task in tasks
+        if (parsed := parse_time(task.get("task_completed_at"))) is not None
+    ]
+    kill_to_drain = (
+        (max(completion_times) - kill_time).total_seconds()
+        if kill_time is not None and completion_times
+        else None
+    )
+    affected = failure_boundary.get("affected_tasks", [])
+    raw["affected_task_count"] = len(affected) if isinstance(affected, list) else 0
+    raw["kill_to_final_drain_seconds"] = kill_to_drain
+    raw["negative_durations"]["kill_to_final_drain"] = int(
+        kill_to_drain is not None and kill_to_drain < 0
+    )
+    return raw
+
+
+def recovery_history_evidence(
+    tasks: list[dict[str, str]],
+    attempts: list[dict[str, str]],
+    failure_boundary: dict[str, Any],
+    expected_tasks: int,
+) -> dict[str, Any]:
+    """Validate the exact captured ABANDONED-to-success recovery histories."""
+    task_ids = {row.get("task_id") for row in tasks}
+    attempts_by_task: dict[str | None, list[dict[str, str]]] = {}
+    for attempt in attempts:
+        attempts_by_task.setdefault(attempt.get("task_id"), []).append(attempt)
+
+    affected_rows = failure_boundary.get("affected_tasks", [])
+    affected = affected_rows if isinstance(affected_rows, list) else []
+    affected_ids = [row.get("task_id") for row in affected if isinstance(row, dict)]
+    affected_set = {value for value in affected_ids if value}
+    selected_workers = failure_boundary.get("selected_workers", [])
+    selected = selected_workers if isinstance(selected_workers, list) else []
+    selected_owner_ids = {
+        row.get("worker_id") for row in selected if isinstance(row, dict) and row.get("worker_id")
+    }
+    affected_owner_ids = {
+        row.get("owner_worker_id")
+        for row in affected
+        if isinstance(row, dict) and row.get("owner_worker_id")
+    }
+
+    duplicate_attempt_identities = len(attempts) - len(
+        {(row.get("task_id"), row.get("attempt_number")) for row in attempts}
+    )
+    orphan_attempts = sum(row.get("task_id") not in task_ids for row in attempts)
+    abandoned_rows = [row for row in attempts if row.get("status") == "ABANDONED"]
+    abandoned_ids = {row.get("task_id") for row in abandoned_rows}
+    unaffected_abandoned = len(abandoned_ids - affected_set)
+    duplicate_abandonments = len(abandoned_rows) - len(abandoned_ids)
+
+    recovered_successes = 0
+    captured_attempt_mismatches = 0
+    replacement_failures = 0
+    stale_owner_completions = 0
+    unexpected_histories = 0
+    for boundary_row in affected:
+        if not isinstance(boundary_row, dict):
+            captured_attempt_mismatches += 1
+            continue
+        task_id = boundary_row.get("task_id")
+        captured_number = str(boundary_row.get("attempt_number") or "")
+        captured_id = boundary_row.get("attempt_id")
+        rows = sorted(
+            attempts_by_task.get(task_id, []),
+            key=lambda row: int(row.get("attempt_number") or 0),
+        )
+        captured = [
+            row
+            for row in rows
+            if row.get("attempt_number") == captured_number and row.get("attempt_id") == captured_id
+        ]
+        captured_ok = bool(
+            len(captured) == 1
+            and captured[0].get("status") == "ABANDONED"
+            and captured[0].get("worker_id") == boundary_row.get("owner_worker_id")
+            and captured[0].get("recovery_action") == "requeued"
+            and captured[0].get("recovered_at")
+            and captured[0].get("recovered_lease_expires_at")
+            == boundary_row.get("lease_expires_at")
+        )
+        captured_attempt_mismatches += int(not captured_ok)
+        stale_owner_completions += int(bool(captured) and captured[0].get("status") == "SUCCEEDED")
+        later = [
+            row for row in rows if int(row.get("attempt_number") or 0) > int(captured_number or 0)
+        ]
+        later_success = [row for row in later if row.get("status") == "SUCCEEDED"]
+        stale_owner_completions += sum(
+            row.get("worker_id") in selected_owner_ids for row in later_success
+        )
+        exact_history = bool(
+            captured_ok
+            and len(rows) == 2
+            and len(later) == 1
+            and len(later_success) == 1
+            and int(later[0].get("attempt_number") or 0) == int(captured_number or 0) + 1
+        )
+        recovered_successes += int(exact_history)
+        replacement_failures += int(not later_success)
+        unexpected_histories += int(not exact_history)
+
+    first_attempt_successes = 0
+    for task_id in task_ids - affected_set:
+        rows = attempts_by_task.get(task_id, [])
+        exact_first_success = bool(
+            len(rows) == 1
+            and rows[0].get("attempt_number") == "1"
+            and rows[0].get("status") == "SUCCEEDED"
+        )
+        first_attempt_successes += int(exact_first_success)
+        unexpected_histories += int(not exact_first_success)
+
+    unfinished_attempts = sum(
+        row.get("status") not in {"SUCCEEDED", "FAILED", "ABANDONED"} for row in attempts
+    )
+    selected_worker_count = int(failure_boundary.get("expected_killed_workers") or 0)
+    liveness = failure_boundary.get("worker_liveness", {})
+    liveness_ok = bool(
+        isinstance(liveness, dict)
+        and int(liveness.get("killed_dead") or 0) == selected_worker_count
+        and int(liveness.get("surviving_active") or 0)
+        == int(liveness.get("expected_surviving_workers") or 0)
+    )
+    boundary_shape_ok = bool(
+        failure_boundary.get("kill_timestamp")
+        and len(selected) == selected_worker_count
+        and len(selected_owner_ids) == selected_worker_count
+        and affected_set
+        and len(affected_ids) == len(affected_set)
+        and len({row.get("attempt_id") for row in affected if isinstance(row, dict)})
+        == len(affected_set)
+        and int(failure_boundary.get("affected_task_count") or 0) == len(affected_set)
+        and affected_owner_ids == selected_owner_ids
+        and all(
+            isinstance(row, dict)
+            and row.get("pre_kill_status") == "RUNNING"
+            and row.get("task_id")
+            and row.get("attempt_id")
+            and row.get("attempt_number")
+            and row.get("lease_expires_at")
+            and row.get("owner_worker_id")
+            for row in affected
+        )
+    )
+    expected_attempts = expected_tasks + len(affected_set)
+    evidence = {
+        "recovery_history_expected": True,
+        "expected_affected_tasks": len(affected_set),
+        "affected_tasks": len(affected_set),
+        "expected_abandoned": len(affected_set),
+        "abandoned_attempts": len(abandoned_rows),
+        "first_attempt_successes": first_attempt_successes,
+        "recovered_replacement_successes": recovered_successes,
+        "captured_attempt_mismatches": captured_attempt_mismatches,
+        "replacement_success_failures": replacement_failures,
+        "unaffected_abandoned_attempts": unaffected_abandoned,
+        "duplicate_recovery_abandonments": duplicate_abandonments,
+        "duplicate_attempt_identities": duplicate_attempt_identities,
+        "orphan_attempts": orphan_attempts,
+        "stale_owner_completions": stale_owner_completions,
+        "unfinished_attempts": unfinished_attempts,
+        "unexpected_recovery_histories": unexpected_histories,
+        "expected_total_attempts": expected_attempts,
+        "worker_liveness_passed": liveness_ok,
+        "failure_boundary_passed": boundary_shape_ok,
+        "stale_lease_renewal_evidence_available": False,
+    }
+    evidence["recovery_history_passed"] = bool(
+        len(tasks) == expected_tasks
+        and len(attempts) == expected_attempts
+        and task_ids == set(attempts_by_task)
+        and affected_set <= task_ids
+        and len(abandoned_rows) == len(affected_set)
+        and abandoned_ids == affected_set
+        and first_attempt_successes == expected_tasks - len(affected_set)
+        and recovered_successes == len(affected_set)
+        and captured_attempt_mismatches == 0
+        and replacement_failures == 0
+        and unaffected_abandoned == 0
+        and duplicate_abandonments == 0
+        and duplicate_attempt_identities == 0
+        and orphan_attempts == 0
+        and stale_owner_completions == 0
+        and unfinished_attempts == 0
+        and unexpected_histories == 0
+        and boundary_shape_ok
+        and liveness_ok
+    )
+    return evidence
 
 
 def retry_history_evidence(
@@ -668,6 +872,97 @@ def process_identity_changes(start: dict[str, Any], end: dict[str, Any]) -> dict
     }
 
 
+def _identity_target(value: str) -> str:
+    try:
+        labels = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return value
+    return f"{labels.get('job')}|{labels.get('instance')}"
+
+
+def allowed_worker_churn_analysis(
+    start: dict[str, Any],
+    end: dict[str, Any],
+    identities: dict[str, list[str]],
+    allowed: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Separate explicitly killed worker churn from unrelated churn."""
+    if not allowed:
+        return {
+            "configured": False,
+            "unexpected_target_churn": target_ids(start) != target_ids(end),
+            "unexpected_replica_churn": replica_ids(start) != replica_ids(end),
+            "unexpected_process_identity_changes": identities,
+            "allowed_worker_churn_observed": False,
+            "unobserved_allowed_worker_churn": [],
+        }
+
+    allowed_start_targets = set(allowed.get("start_targets", []))
+    allowed_end_targets = set(allowed.get("end_targets", []))
+    allowed_start_replicas = set(allowed.get("start_replicas", []))
+    allowed_end_replicas = set(allowed.get("end_replicas", []))
+    start_workers = target_ids(start, "taskforge-worker")
+    end_workers = target_ids(end, "taskforge-worker")
+    unexpected_worker_targets = bool(
+        (start_workers - end_workers) - allowed_start_targets
+        or (end_workers - start_workers) - allowed_end_targets
+    )
+    stable_services_changed = any(
+        target_ids(start, job) != target_ids(end, job)
+        for job in ("taskforge-api", "taskforge-scheduler")
+    )
+
+    unexpected_identities: dict[str, list[str]] = {}
+    for kind, values in identities.items():
+        permitted = (
+            allowed_end_targets
+            if kind in {"new", "unobserved_end_targets"}
+            else allowed_start_targets
+        )
+        unexpected_identities[kind] = sorted(
+            value for value in values if _identity_target(value) not in permitted
+        )
+
+    unexpected_replicas = bool(
+        (replica_ids(start) - replica_ids(end)) - allowed_start_replicas
+        or (replica_ids(end) - replica_ids(start)) - allowed_end_replicas
+    )
+    changed_start_targets = {
+        _identity_target(value)
+        for kind in ("restarted", "missing", "unobserved_start_targets")
+        for value in identities.get(kind, [])
+    } | (start_workers - end_workers)
+    changed_end_targets = {
+        _identity_target(value)
+        for kind in ("restarted", "new", "unobserved_end_targets")
+        for value in identities.get(kind, [])
+    } | (end_workers - start_workers)
+    removed_replicas = replica_ids(start) - replica_ids(end)
+    added_replicas = replica_ids(end) - replica_ids(start)
+    unobserved_pairs = []
+    for pair in allowed.get("pairs", []):
+        start_target = pair.get("start_target")
+        end_target = pair.get("end_target")
+        start_replica = pair.get("start_replica")
+        end_replica = pair.get("end_replica")
+        observed = bool(
+            start_target in changed_start_targets
+            or end_target in changed_end_targets
+            or start_replica in removed_replicas
+            or end_replica in added_replicas
+        )
+        if not observed:
+            unobserved_pairs.append(str(pair.get("worker_name") or start_target))
+    return {
+        "configured": True,
+        "unexpected_target_churn": stable_services_changed or unexpected_worker_targets,
+        "unexpected_replica_churn": unexpected_replicas,
+        "unexpected_process_identity_changes": unexpected_identities,
+        "allowed_worker_churn_observed": bool(allowed.get("pairs")) and not unobserved_pairs,
+        "unobserved_allowed_worker_churn": sorted(unobserved_pairs),
+    }
+
+
 def delta_quantiles(delta: dict[str, Any]) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for percentile, fraction in ((50, 0.50), (95, 0.95), (99, 0.99)):
@@ -684,25 +979,26 @@ def build_reconciliation(
     scenario: str,
     *,
     intentional_worker_churn: bool = False,
+    allowed_worker_churn: dict[str, Any] | None = None,
     legacy_execution_percentile: bool = False,
     require_retry_batch: bool = False,
+    require_recovery_contract: bool = False,
 ) -> dict[str, Any]:
     start_targets = target_ids(start)
     end_targets = target_ids(end)
     worker_churn = target_ids(start, "taskforge-worker") != target_ids(end, "taskforge-worker")
     identities = process_identity_changes(start, end)
-    process_churn = any(identities.values())
     start_replica_ids = replica_ids(start)
     end_replica_ids = replica_ids(end)
     replica_churn = start_replica_ids != end_replica_ids
     start_boundary_errors = boundary_errors(start)
     end_boundary_errors = boundary_errors(end)
+    churn = allowed_worker_churn_analysis(start, end, identities, allowed_worker_churn)
     stable_target_churn = (
-        target_ids(start, "taskforge-api") != target_ids(end, "taskforge-api")
-        or target_ids(start, "taskforge-scheduler") != target_ids(end, "taskforge-scheduler")
-        or worker_churn
-        or process_churn
-        or replica_churn
+        churn["unexpected_target_churn"]
+        or churn["unexpected_replica_churn"]
+        or any(churn["unexpected_process_identity_changes"].values())
+        or (bool(allowed_worker_churn) and not churn["allowed_worker_churn_observed"])
         or bool(start_boundary_errors)
         or bool(end_boundary_errors)
     )
@@ -710,6 +1006,7 @@ def build_reconciliation(
 
     expected_counters: dict[str, int] = {}
     counter_labels: dict[str, dict[str, str]] = {}
+    counter_metrics: dict[str, str] = {}
     if scenario in API_SUBMISSION_SCENARIOS:
         expected_counters["api_requests"] = int(raw.get("task_count", 0))
         counter_labels["api_requests"] = {
@@ -719,6 +1016,14 @@ def build_reconciliation(
         }
         expected_counters["api_submissions"] = int(raw.get("task_count", 0))
         counter_labels["api_submissions"] = {"outcome": "created"}
+    elif scenario == "recovery_storm" and require_recovery_contract:
+        recovered = int(raw.get("attempt_status_counts", {}).get("ABANDONED", 0))
+        expected_counters["recoveries_requeued"] = recovered
+        counter_labels["recoveries_requeued"] = {"outcome": "requeued"}
+        counter_metrics["recoveries_requeued"] = COUNTER_METRICS["recoveries"]
+        expected_counters["recoveries_exhausted"] = 0
+        counter_labels["recoveries_exhausted"] = {"outcome": "failed"}
+        counter_metrics["recoveries_exhausted"] = COUNTER_METRICS["recoveries"]
     else:
         expected_counters["claimed"] = int(raw.get("attempt_count", 0))
         expected_counters["completed"] = int(raw.get("attempt_count", 0)) - int(
@@ -730,13 +1035,18 @@ def build_reconciliation(
             raw.get("attempt_status_counts", {}).get("FAILED", 0)
         )
         expected_counters["retry_promotions"] = int(raw.get("retry_lateness_observations", 0))
-    if scenario == "recovery_storm":
+    if scenario == "recovery_storm" and not require_recovery_contract:
         expected_counters["recoveries"] = int(
             raw.get("attempt_status_counts", {}).get("ABANDONED", 0)
         )
 
     for name, expected in expected_counters.items():
-        measured = counter_delta(start, end, COUNTER_METRICS[name], labels=counter_labels.get(name))
+        measured = counter_delta(
+            start,
+            end,
+            counter_metrics[name] if name in counter_metrics else COUNTER_METRICS[name],
+            labels=counter_labels.get(name),
+        )
         difference = measured["delta"] - expected
         measured.update(
             {
@@ -753,7 +1063,7 @@ def build_reconciliation(
 
     histograms: dict[str, Any] = {}
     histogram_specs: list[tuple[str, str, str, int]] = []
-    if scenario not in API_SUBMISSION_SCENARIOS:
+    if scenario not in API_SUBMISSION_SCENARIOS and not require_recovery_contract:
         histogram_specs.extend(
             [
                 ("queue", "queue_p95_seconds", "queue_observations", 95),
@@ -864,6 +1174,30 @@ def build_reconciliation(
             "status": status,
         }
 
+    if scenario == "recovery_storm" and require_recovery_contract:
+        recovery_batch_delta = histogram_delta(start, end, HISTOGRAM_METRICS["recovery_batch"])
+        recovery_batch_quantiles = delta_quantiles(recovery_batch_delta)
+        recovery_batch_observations = (
+            float(recovery_batch_delta["buckets"][-1]["count"])
+            if recovery_batch_delta.get("buckets")
+            else 0.0
+        )
+        histograms["recovery_batch"] = {
+            **recovery_batch_delta,
+            "prometheus_quantiles": recovery_batch_quantiles,
+            "raw": None,
+            "prometheus": recovery_batch_quantiles["p95"],
+            "raw_expected_observations": None,
+            "prometheus_observations": recovery_batch_observations,
+            "raw_bucket": None,
+            "status": "PASS"
+            if recovery_batch_delta["valid"]
+            and not stable_target_churn
+            and recovery_batch_observations > 0
+            else "FAIL",
+            "note": "Operational scheduler recovery-batch histogram; raw recovery lag remains authoritative.",
+        }
+
     if scenario == "retry_storm" and require_retry_batch:
         retry_batch_delta = histogram_delta(start, end, HISTOGRAM_METRICS["retry_batch"])
         retry_batch_quantiles = delta_quantiles(retry_batch_delta)
@@ -894,7 +1228,7 @@ def build_reconciliation(
     status = (
         "PASS" if not stable_target_churn and all(value == "PASS" for value in required) else "FAIL"
     )
-    return {
+    reconciliation = {
         "prometheus_valid": status == "PASS",
         "status": status,
         "intentional_worker_churn": intentional_worker_churn,
@@ -911,6 +1245,17 @@ def build_reconciliation(
         "counters": counters,
         "histograms": histograms,
     }
+    if allowed_worker_churn is not None:
+        reconciliation.update(
+            {
+                "allowed_worker_churn": allowed_worker_churn,
+                "allowed_worker_churn_observed": churn["allowed_worker_churn_observed"],
+                "unobserved_allowed_worker_churn": churn["unobserved_allowed_worker_churn"],
+                "unexpected_process_identity_changes": churn["unexpected_process_identity_changes"],
+                "unexpected_replica_churn": churn["unexpected_replica_churn"],
+            }
+        )
+    return reconciliation
 
 
 def aggregate(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1102,7 +1447,10 @@ def _int_value(value: Any) -> int | None:
 
 
 def _correctness_errors(
-    item: dict[str, Any], tasks: list[dict[str, str]], attempts: list[dict[str, str]]
+    item: dict[str, Any],
+    tasks: list[dict[str, str]],
+    attempts: list[dict[str, str]],
+    failure_boundary: dict[str, Any] | None = None,
 ) -> list[str]:
     check = item.get("correctness", {})
     errors = []
@@ -1194,28 +1542,54 @@ def _correctness_errors(
         for field, value in evidence.items():
             if check.get(field) != value:
                 errors.append(f"recorded retry history {field} does not match raw attempts")
+    if item.get("scenario") == "recovery_storm" and check.get("recovery_history_expected") is True:
+        if not failure_boundary:
+            errors.append("failure-boundary evidence is missing")
+        else:
+            if _int_value(failure_boundary.get("expected_killed_workers")) != _int_value(
+                item.get("killed_workers")
+            ):
+                errors.append("failure-boundary kill count differs from the indexed trial")
+            evidence = recovery_history_evidence(
+                tasks, attempts, failure_boundary, expected_tasks or 0
+            )
+            if evidence.get("recovery_history_passed") is not True:
+                errors.append("captured crash-recovery attempt history is invalid")
+            for field, value in evidence.items():
+                if check.get(field) != value:
+                    errors.append(f"recorded recovery history {field} does not match raw evidence")
     return errors
 
 
 def _prometheus_errors(reconciliation: dict[str, Any]) -> list[str]:
     errors = []
+    failure_aware = bool(reconciliation.get("allowed_worker_churn"))
     if reconciliation.get("prometheus_valid") is not True:
         errors.append("prometheus_valid is not true")
     if reconciliation.get("status") != "PASS":
         errors.append("reconciliation status is not PASS")
     if reconciliation.get("unexpected_target_churn") is not False:
         errors.append("unexpected target or process churn was detected")
-    if reconciliation.get("replica_churn") is not False:
+    if failure_aware:
+        if reconciliation.get("allowed_worker_churn_observed") is not True:
+            errors.append("explicitly allowed killed-worker churn was not observed")
+        unexpected_identities = reconciliation.get("unexpected_process_identity_changes", {})
+        if not isinstance(unexpected_identities, dict) or any(unexpected_identities.values()):
+            errors.append("process churn outside the killed-worker allowlist was detected")
+        if reconciliation.get("unexpected_replica_churn") is not False:
+            errors.append("replica churn outside the killed-worker allowlist was detected")
+    elif reconciliation.get("replica_churn") is not False:
         errors.append("replica churn was detected")
     if reconciliation.get("start_boundary_errors") or reconciliation.get("end_boundary_errors"):
         errors.append("Prometheus boundary errors were recorded")
-    identities = reconciliation.get("process_identity_changes", {})
-    if not isinstance(identities, dict) or any(identities.values()):
-        errors.append("target process identities changed or were not fully observed")
-    if reconciliation.get("start_targets") != reconciliation.get("end_targets"):
-        errors.append("start and end target sets differ")
-    if reconciliation.get("start_replicas") != reconciliation.get("end_replicas"):
-        errors.append("start and end replica sets differ")
+    if not failure_aware:
+        identities = reconciliation.get("process_identity_changes", {})
+        if not isinstance(identities, dict) or any(identities.values()):
+            errors.append("target process identities changed or were not fully observed")
+        if reconciliation.get("start_targets") != reconciliation.get("end_targets"):
+            errors.append("start and end target sets differ")
+        if reconciliation.get("start_replicas") != reconciliation.get("end_replicas"):
+            errors.append("start and end replica sets differ")
     for name, counter in reconciliation.get("counters", {}).items():
         if (
             counter.get("valid") is not True
@@ -1305,9 +1679,12 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             source_errors.append(f"{name}: {directory_error}")
             continue
         assert artifact_dir is not None
+        required_trial_artifacts = set(REQUIRED_TRIAL_ARTIFACTS)
+        if document.get("tf_ticket") == "TF-012E6" and item.get("scenario") == "recovery_storm":
+            required_trial_artifacts.add("failure_boundary.json")
         missing = sorted(
             artifact
-            for artifact in REQUIRED_TRIAL_ARTIFACTS
+            for artifact in required_trial_artifacts
             if not (artifact_dir / artifact).is_file()
         )
         raw_errors.extend(f"{name}: {artifact} missing" for artifact in missing)
@@ -1318,6 +1695,7 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             source_errors.extend(errors)
         if missing:
             continue
+        failure_boundary: dict[str, Any] | None = None
         try:
             tasks = read_csv(artifact_dir / "tasks.csv")
             attempts = read_csv(artifact_dir / "attempts.csv")
@@ -1327,11 +1705,13 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             end = _read_json(artifact_dir / "prometheus_end.json")
             saved_reconciliation = _read_json(artifact_dir / "prometheus_reconciliation.json")
             saved_summary = _read_json(artifact_dir / "summary.json")
-            recalculated = (
-                derive_retry_raw(tasks, attempts)
-                if document.get("tf_ticket") == "TF-012E5" and item.get("scenario") == "retry_storm"
-                else derive_raw(tasks, attempts)
-            )
+            if document.get("tf_ticket") == "TF-012E6" and item.get("scenario") == "recovery_storm":
+                failure_boundary = _read_json(artifact_dir / "failure_boundary.json")
+                recalculated = derive_recovery_raw(tasks, attempts, failure_boundary)
+            elif document.get("tf_ticket") == "TF-012E5" and item.get("scenario") == "retry_storm":
+                recalculated = derive_retry_raw(tasks, attempts)
+            else:
+                recalculated = derive_raw(tasks, attempts)
         except (OSError, ValueError, KeyError, AssertionError, json.JSONDecodeError) as exc:
             raw_errors.append(f"{name}: artifact parsing failed: {exc}")
             continue
@@ -1342,6 +1722,10 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             prometheus_failures.append(f"{name}: indexed reconciliation differs from artifact")
         if not _json_equivalent(saved_summary.get("submission"), item.get("submission")):
             raw_errors.append(f"{name}: indexed submission differs from artifact")
+        if failure_boundary is not None and not _json_equivalent(
+            failure_boundary, item.get("failure_boundary")
+        ):
+            raw_errors.append(f"{name}: indexed failure boundary differs from artifact")
         for field in ("scenario", "variant", "classification", "block", "trial"):
             if metadata.get(field) != item.get(field):
                 raw_errors.append(f"{name}: metadata {field} identity mismatch")
@@ -1357,7 +1741,8 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
                 latency_failures.append(f"{name}: negative {duration} duration")
 
         correctness_failures.extend(
-            f"{name}: {error}" for error in _correctness_errors(item, tasks, attempts)
+            f"{name}: {error}"
+            for error in _correctness_errors(item, tasks, attempts, failure_boundary)
         )
         intentional = bool(metadata.get("intentional_worker_churn", False))
         rebuilt_reconciliation = build_reconciliation(
@@ -1366,8 +1751,10 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
             end,
             str(item.get("scenario")),
             intentional_worker_churn=intentional,
+            allowed_worker_churn=(failure_boundary or {}).get("prometheus_allowed_churn"),
             legacy_execution_percentile=legacy_execution_percentile,
             require_retry_batch=document.get("tf_ticket") == "TF-012E5",
+            require_recovery_contract=document.get("tf_ticket") == "TF-012E6",
         )
         if not _json_equivalent(rebuilt_reconciliation, saved_reconciliation):
             prometheus_failures.append(
@@ -1425,7 +1812,12 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
     if "retry_storm" in required_scenarios:
         required_groups.add(("retry_storm", "fail-once"))
     if "recovery_storm" in required_scenarios:
-        required_groups.add(("recovery_storm", f"kill-{profile.get('recovery_kill_percentage')}"))
+        recovery_variant = (
+            f"kill-{profile.get('recovery_kill_workers')}-of-{profile.get('recovery_workers')}"
+            if document.get("tf_ticket") == "TF-012E6"
+            else f"kill-{profile.get('recovery_kill_percentage')}"
+        )
+        required_groups.add(("recovery_storm", recovery_variant))
     repetition_failures.extend(
         f"{scenario}/{variant}=missing"
         for scenario, variant in sorted(required_groups - set(public_groups))
@@ -1437,7 +1829,7 @@ def evaluate_trust(document: dict[str, Any], output_dir: pathlib.Path) -> dict[s
     if len(blocks) != len(block_events):
         reproducibility_failures.append("run block identities are missing or duplicated")
     independent_scenarios = set(CORE_SCALING_SCENARIOS)
-    if document.get("tf_ticket") in {"TF-012E4", "TF-012E5"}:
+    if document.get("tf_ticket") in {"TF-012E4", "TF-012E5", "TF-012E6"}:
         independent_scenarios.update(required_scenarios)
     independent_public = [item for item in public if item.get("scenario") in independent_scenarios]
     for (scenario, variant), _ in public_groups.items():

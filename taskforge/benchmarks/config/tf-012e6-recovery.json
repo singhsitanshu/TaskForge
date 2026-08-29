@@ -1,0 +1,30 @@
+{
+  "name": "tf-012e6-recovery",
+  "description": "Publishable TF-012E6 fixed worker-crash recovery experiment.",
+  "minimum_public_trials": 3,
+  "required_blocks": 3,
+  "required_public_scenarios": ["recovery_storm"],
+  "random_seed": 120126,
+  "cooldown_seconds": 1,
+  "warmup_tasks": 100,
+  "recovery_tasks": 1000,
+  "recovery_workers": 20,
+  "recovery_schedulers": 3,
+  "recovery_kill_workers": 10,
+  "recovery_sleep_ms": 500,
+  "workload": {
+    "task_type": "test.sleep",
+    "payload": {"duration_ms": 500},
+    "max_attempts": 2
+  },
+  "timing_configuration": {
+    "WORKER_HEARTBEAT_INTERVAL": "1s",
+    "WORKER_STALE_AFTER": "5s",
+    "WORKER_DEAD_AFTER": "10s",
+    "WORKER_TASK_LEASE_DURATION": "5s",
+    "WORKER_TASK_LEASE_RENEW_INTERVAL": "1s",
+    "WORKER_TASK_LEASE_RENEW_TIMEOUT": "500ms",
+    "SCHEDULER_RECOVERY_INTERVAL": "100ms",
+    "SCHEDULER_RECOVERY_BATCH_SIZE": "1000"
+  }
+}

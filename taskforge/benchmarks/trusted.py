@@ -37,8 +37,10 @@ from benchmarks.trust import (
     build_reconciliation,
     create_manifest,
     derive_raw,
+    derive_recovery_raw,
     derive_retry_raw,
     evaluate_trust,
+    recovery_history_evidence,
     retry_history_evidence,
     sha256_file,
     write_csv,
@@ -699,6 +701,163 @@ def retry_storm_correctness(
     return check
 
 
+def deterministic_recovery_victims(
+    containers: list[str], killed_workers: int, seed: int
+) -> list[str]:
+    """Choose exact worker containers reproducibly without relying on Compose order."""
+    ordered = sorted(containers)
+    if len(ordered) < killed_workers:
+        raise BenchmarkError(
+            f"recovery trial requires {killed_workers} victims from {len(ordered)} workers"
+        )
+    return sorted(random.Random(seed).sample(ordered, killed_workers))
+
+
+def container_runtime_identities(containers: list[str]) -> list[dict[str, Any]]:
+    if not containers:
+        return []
+    inspected = json.loads(run_command(["docker", "inspect", *containers], timeout=60).stdout)
+    identities = []
+    for item in inspected:
+        networks = item.get("NetworkSettings", {}).get("Networks", {}) or {}
+        addresses = sorted(
+            network.get("IPAddress") for network in networks.values() if network.get("IPAddress")
+        )
+        identities.append(
+            {
+                "container_name": str(item.get("Name", "")).lstrip("/"),
+                "container_id": str(item.get("Id", ""))[:12],
+                "hostname": item.get("Config", {}).get("Hostname"),
+                "worker_targets": [f"taskforge-worker|{address}:8080" for address in addresses],
+            }
+        )
+    return sorted(identities, key=lambda item: item["container_name"])
+
+
+def _sql_values(values: list[str]) -> str:
+    return ",".join("'" + value.replace("'", "''") + "'" for value in values)
+
+
+def recovery_worker_rows(harness: Harness, worker_names: list[str]) -> list[dict[str, Any]]:
+    names = _sql_values(worker_names)
+    result = harness.json_sql(
+        "SELECT json_build_object('workers', coalesce(json_agg(row_to_json(selected)), "
+        "'[]'::json)) FROM (SELECT DISTINCT ON (name) id::text AS worker_id, "
+        "instance_id, name AS worker_name, last_seen_at::text FROM workers "
+        f"WHERE name IN ({names}) ORDER BY name, last_seen_at DESC NULLS LAST) AS selected"
+    )
+    workers = result.get("workers", [])
+    return workers if isinstance(workers, list) else []
+
+
+def captured_recovery_tasks(
+    harness: Harness, queue: str, worker_names: list[str]
+) -> list[dict[str, Any]]:
+    names = _sql_values(worker_names)
+    escaped_queue = queue.replace("'", "''")
+    result = harness.json_sql(
+        "SELECT json_build_object('affected_tasks', coalesce(json_agg(row_to_json(owned) "
+        "ORDER BY owned.task_id), '[]'::json)) FROM (SELECT task.id::text AS task_id, "
+        "attempt.id::text AS attempt_id, attempt.attempt_number, task.lease_expires_at::text "
+        "AS lease_expires_at, task.claimed_by_worker_id::text AS owner_worker_id, "
+        "worker.instance_id AS owner_instance_id, worker.name AS owner_name, "
+        "task.status::text AS pre_kill_status FROM tasks AS task JOIN workers AS worker "
+        "ON worker.id=task.claimed_by_worker_id JOIN task_attempts AS attempt "
+        "ON attempt.task_id=task.id AND attempt.attempt_number=task.attempt_count "
+        f"WHERE task.queue='{escaped_queue}' AND task.status='RUNNING' "
+        "AND attempt.status='RUNNING' "
+        f"AND worker.name IN ({names})) AS owned"
+    )
+    affected = result.get("affected_tasks", [])
+    return affected if isinstance(affected, list) else []
+
+
+def wait_for_selected_worker_ownership(
+    harness: Harness,
+    queue: str,
+    worker_names: list[str],
+    *,
+    timeout: float = 30,
+) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        affected = captured_recovery_tasks(harness, queue, worker_names)
+        owners = {row.get("owner_name") for row in affected}
+        if owners == set(worker_names):
+            return affected
+        time.sleep(0.02)
+    raise BenchmarkError(
+        "could not establish a failure boundary with active work on every selected worker"
+    )
+
+
+def wait_for_recovery_worker_liveness(
+    harness: Harness,
+    killed_worker_ids: list[str],
+    surviving_worker_ids: list[str],
+    *,
+    timeout: float = 30,
+) -> dict[str, Any]:
+    killed = _sql_values(killed_worker_ids)
+    surviving = _sql_values(surviving_worker_ids)
+    stale = harness.env["WORKER_STALE_AFTER"].replace("'", "''")
+    dead = harness.env["WORKER_DEAD_AFTER"].replace("'", "''")
+    query = (
+        "SELECT json_build_object("
+        f"'expected_killed_workers', {len(killed_worker_ids)}, "
+        f"'expected_surviving_workers', {len(surviving_worker_ids)}, "
+        "'killed_dead', (SELECT count(*) FROM workers WHERE id::text IN ("
+        + killed
+        + f") AND (last_seen_at IS NULL OR last_seen_at <= clock_timestamp()-'{dead}'::interval)), "
+        "'surviving_active', (SELECT count(*) FROM workers WHERE id::text IN ("
+        + surviving
+        + f") AND last_seen_at > clock_timestamp()-'{stale}'::interval))"
+    )
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = harness.json_sql(query)
+        if int(last.get("killed_dead") or 0) == len(killed_worker_ids) and int(
+            last.get("surviving_active") or 0
+        ) == len(surviving_worker_ids):
+            break
+        time.sleep(0.25)
+    all_ids = _sql_values([*killed_worker_ids, *surviving_worker_ids])
+    last["workers"] = harness.json_sql(
+        "SELECT json_build_object('workers', coalesce(json_agg(json_build_object("
+        "'worker_id', id::text, 'instance_id', instance_id, 'name', name, "
+        "'last_seen_at', last_seen_at::text, 'classification', CASE "
+        f"WHEN id::text IN ({killed}) AND (last_seen_at IS NULL OR "
+        f"last_seen_at <= clock_timestamp()-'{dead}'::interval) THEN 'DEAD' "
+        f"WHEN id::text IN ({surviving}) AND last_seen_at > "
+        f"clock_timestamp()-'{stale}'::interval THEN 'ACTIVE' ELSE 'OTHER' END) "
+        "ORDER BY id), '[]'::json)) FROM workers WHERE id::text IN (" + all_ids + ")"
+    ).get("workers", [])
+    return last
+
+
+def recovery_storm_correctness(
+    harness: Harness,
+    queue: str,
+    expected_tasks: int,
+    tasks: list[dict[str, str]],
+    attempts: list[dict[str, str]],
+    failure_boundary: dict[str, Any],
+) -> dict[str, Any]:
+    expected_attempts = expected_tasks + len(failure_boundary.get("affected_tasks", []))
+    check = trusted_correctness(
+        harness,
+        queue,
+        expected_tasks,
+        expected_attempts,
+        expected_abandoned=len(failure_boundary.get("affected_tasks", [])),
+    )
+    evidence = recovery_history_evidence(tasks, attempts, failure_boundary, expected_tasks)
+    check.update(evidence)
+    check["passed"] = bool(check["passed"] and evidence["recovery_history_passed"])
+    return check
+
+
 class TrustedRun:
     def __init__(
         self,
@@ -782,6 +941,7 @@ class TrustedRun:
         resource_samples: list[dict[str, Any]],
         metadata: dict[str, Any],
         extra: dict[str, Any] | None = None,
+        additional_artifacts: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         directory = self.artifact_directory(scenario, variant, block, trial)
         metadata.update(
@@ -809,6 +969,10 @@ class TrustedRun:
             directory / "summary.json",
             {"raw": raw, "submission": submission, "extra": extra or {}},
         )
+        for name, value in (additional_artifacts or {}).items():
+            if pathlib.PurePosixPath(name).name != name or not name.endswith(".json"):
+                raise BenchmarkError(f"unsafe additional trial artifact name: {name}")
+            write_json(directory / name, value)
         manifest = create_manifest(directory)
         relative = directory.relative_to(self.output_dir).as_posix()
         classification = self.classification(scenario)
@@ -1166,6 +1330,217 @@ class TrustedRun:
                 "stranded_attempts": stranded,
                 "captured_running_before_kill": captured,
             },
+        )
+
+    def recovery_crash_trial(
+        self,
+        *,
+        block: int,
+        trial: int,
+        workers: int,
+        schedulers: int,
+        count: int,
+        killed_workers: int,
+        sleep_ms: int,
+        selection_seed: int,
+        order_index: int = 1,
+    ) -> dict[str, Any]:
+        """Run the fixed failure-aware E6 crash-recovery trial."""
+        scenario = "recovery_storm"
+        variant = f"kill-{killed_workers}-of-{workers}"
+        queue = f"tf012b-{scenario}-{variant}-b{block}-t{trial}"[:128]
+        print(
+            f"[{scenario}] variant={variant} block={block} trial={trial} workers={workers}",
+            flush=True,
+        )
+        host_before = self.host_state()
+        prom_start = prepare_trial(self.harness, workers, schedulers)
+        containers = worker_containers(self.harness)
+        if len(containers) != workers:
+            raise BenchmarkError(f"expected {workers} worker containers, found {len(containers)}")
+        victims = deterministic_recovery_victims(containers, killed_workers, selection_seed)
+        start_descriptors = container_runtime_identities(containers)
+        descriptors_by_name = {item["container_name"]: item for item in start_descriptors}
+        victim_descriptors = [descriptors_by_name[name] for name in victims]
+        victim_hostnames = [str(item["hostname"]) for item in victim_descriptors]
+        all_hostnames = [str(item["hostname"]) for item in start_descriptors]
+        start_worker_rows = recovery_worker_rows(self.harness, all_hostnames)
+        start_workers_by_name = {str(row["worker_name"]): row for row in start_worker_rows}
+        if set(start_workers_by_name) != set(all_hostnames):
+            raise BenchmarkError("could not resolve every starting worker database identity")
+
+        def snapshot_target(identity: dict[str, Any], snapshot: dict[str, Any]) -> str:
+            recorded = {
+                f"{row.get('job')}|{row.get('instance')}" for row in snapshot.get("targets", [])
+            }
+            matches = sorted(set(identity.get("worker_targets", [])) & recorded)
+            if len(matches) != 1:
+                raise BenchmarkError(
+                    f"could not map worker {identity.get('container_name')} to one Prometheus target"
+                )
+            return matches[0]
+
+        trial_started = dt.datetime.now(dt.UTC)
+        with ResourceSampler(self.harness) as resources:
+            submission = self.harness.loadgen(
+                operation="submit",
+                count=count,
+                concurrency=min(200, count),
+                task_type="test.sleep",
+                payload=json.dumps({"duration_ms": sleep_ms}),
+                queue=queue,
+                max_attempts=2,
+                key_mode="unique",
+                key_prefix=queue,
+            )
+            wait_for_selected_worker_ownership(self.harness, queue, victim_hostnames, timeout=30)
+            run_command(["docker", "pause", *victims], timeout=60)
+            affected = captured_recovery_tasks(self.harness, queue, victim_hostnames)
+            affected_owners = {str(row.get("owner_name")) for row in affected}
+            if affected_owners != set(victim_hostnames):
+                raise BenchmarkError(
+                    "selected workers did not all retain active owned tasks at the paused boundary"
+                )
+            selected_workers = []
+            for descriptor in victim_descriptors:
+                worker = start_workers_by_name[str(descriptor["hostname"])]
+                selected_workers.append(
+                    {
+                        **worker,
+                        **descriptor,
+                        "start_target": snapshot_target(descriptor, prom_start),
+                    }
+                )
+            selected_ids = {str(row["worker_id"]) for row in selected_workers}
+            if {str(row.get("owner_worker_id")) for row in affected} != selected_ids:
+                raise BenchmarkError("affected task owners do not match the selected kill set")
+            surviving_workers = [
+                row for name, row in start_workers_by_name.items() if name not in victim_hostnames
+            ]
+            failure_boundary: dict[str, Any] = {
+                "schema_version": 1,
+                "selection_rule": "seeded sample of lexicographically sorted worker containers",
+                "selection_seed": selection_seed,
+                "expected_workers": workers,
+                "expected_killed_workers": killed_workers,
+                "selected_workers": selected_workers,
+                "surviving_workers": surviving_workers,
+                "affected_tasks": affected,
+                "affected_task_count": len(affected),
+                "pre_kill_status": "RUNNING",
+                "hard_kill_method": "docker kill",
+                "kill_timestamp": dt.datetime.now(dt.UTC).isoformat(),
+            }
+            run_command(["docker", "kill", *victims], timeout=60)
+            failure_boundary["kill_completed_at"] = dt.datetime.now(dt.UTC).isoformat()
+            self.harness.compose(
+                "up",
+                "-d",
+                "--no-deps",
+                "--scale",
+                f"worker={workers}",
+                "worker",
+                timeout=180,
+            )
+            self.harness.current_workers = workers
+            self.harness.wait_for_tasks(queue, count, timeout=max(300, count * 2))
+            failure_boundary["final_drain_observed_at"] = dt.datetime.now(dt.UTC).isoformat()
+            failure_boundary["worker_liveness"] = wait_for_recovery_worker_liveness(
+                self.harness,
+                sorted(selected_ids),
+                sorted(str(row["worker_id"]) for row in surviving_workers),
+                timeout=30,
+            )
+
+        trial_end = dt.datetime.now(dt.UTC)
+        prom_end = finish_trial_snapshot(self.harness, workers, schedulers, trial_end)
+        end_containers = worker_containers(self.harness)
+        end_descriptors = {
+            item["container_name"]: item for item in container_runtime_identities(end_containers)
+        }
+        allowed_pairs = []
+        for selected in selected_workers:
+            name = str(selected["container_name"])
+            replacement = end_descriptors.get(name)
+            if replacement is None:
+                raise BenchmarkError(f"replacement worker slot is missing after crash: {name}")
+            allowed_pairs.append(
+                {
+                    "worker_name": name,
+                    "start_target": selected["start_target"],
+                    "end_target": snapshot_target(replacement, prom_end),
+                    "start_replica": (f"worker|{name}|{selected['container_id']}"),
+                    "end_replica": (f"worker|{name}|{replacement['container_id']}"),
+                }
+            )
+        failure_boundary["prometheus_allowed_churn"] = {
+            "start_targets": sorted({str(pair["start_target"]) for pair in allowed_pairs}),
+            "end_targets": sorted({str(pair["end_target"]) for pair in allowed_pairs}),
+            "start_replicas": sorted({str(pair["start_replica"]) for pair in allowed_pairs}),
+            "end_replicas": sorted({str(pair["end_replica"]) for pair in allowed_pairs}),
+            "pairs": allowed_pairs,
+        }
+        tasks, attempts = capture_rows(self.harness, queue)
+        raw = derive_recovery_raw(tasks, attempts, failure_boundary)
+        correct = recovery_storm_correctness(
+            self.harness, queue, count, tasks, attempts, failure_boundary
+        )
+        reconciliation = build_reconciliation(
+            raw,
+            prom_start,
+            prom_end,
+            scenario,
+            intentional_worker_churn=True,
+            allowed_worker_churn=failure_boundary["prometheus_allowed_churn"],
+            require_recovery_contract=True,
+        )
+        metadata = {
+            "run_id": self.run_id,
+            "scenario": scenario,
+            "variant": variant,
+            "classification": "PUBLIC",
+            "block": block,
+            "trial": trial,
+            "order_index": order_index,
+            "random_seed": selection_seed,
+            "trial_start": trial_started.isoformat(),
+            "trial_end": trial_end.isoformat(),
+            "prometheus_start_sample_time": prom_start.get("sample_time_max"),
+            "prometheus_end_sample_time": prom_end.get("sample_time_max"),
+            "host_before": host_before,
+            "host_after": self.host_state(),
+            "configuration": self.harness.trial_configuration(),
+            "intentional_worker_churn": True,
+            "recovery_contract": True,
+        }
+        return self.save_trial(
+            scenario=scenario,
+            variant=variant,
+            block=block,
+            trial=trial,
+            workers=workers,
+            schedulers=schedulers,
+            count=count,
+            queue=queue,
+            task_type="test.sleep",
+            payload={"duration_ms": sleep_ms},
+            submission=submission,
+            tasks=tasks,
+            attempts=attempts,
+            raw=raw,
+            correctness_result=correct,
+            prom_start=prom_start,
+            prom_end=prom_end,
+            reconciliation=reconciliation,
+            resource_samples=resources.samples,
+            metadata=metadata,
+            extra={
+                "order_index": order_index,
+                "random_seed": selection_seed,
+                "killed_workers": killed_workers,
+                "failure_boundary": failure_boundary,
+            },
+            additional_artifacts={"failure_boundary.json": failure_boundary},
         )
 
 

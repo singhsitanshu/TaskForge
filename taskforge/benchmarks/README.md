@@ -21,6 +21,7 @@ make benchmark-release
 make benchmark-tf012e2 E1_RESULTS=benchmarks/results/<trusted-e1-run>/results.json
 make benchmark-tf012e4
 make benchmark-tf012e5
+make benchmark-tf012e6
 ```
 
 Both trusted targets refuse a dirty working tree before building images or
@@ -113,6 +114,23 @@ Inspect the plan without Docker:
 ```text
 make benchmark-tf012e5 DRY_RUN=1
 python3 -m benchmarks.e5 --dry-run
+```
+
+TF-012E6 is a fixed worker-crash recovery path. Each of three independently
+reset trials submits 1,000 bounded 500 ms `test.sleep` tasks with 20 workers and
+3 schedulers, then deterministically hard-kills exactly 10 workers after every
+selected worker owns active work. Each trial archives `failure_boundary.json` as
+the authority for the affected task set, expected ABANDONED attempts, killed
+worker identities, kill time, lease expirations, and the exact failure-aware
+Prometheus churn allowlist. Worker-local counters lost with killed processes are
+not treated as reconstructable; durable PostgreSQL history and scheduler-owned
+recovery metrics are authoritative. The scoped output is
+`tf-012e6-recovery-storm.md` plus exactly four recovery plots. Inspect the fixed
+plan without Docker or failure injection:
+
+```text
+make benchmark-tf012e6 DRY_RUN=1
+python3 -m benchmarks.e6 --dry-run
 ```
 
 ## Publication policy

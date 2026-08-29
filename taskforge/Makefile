@@ -1,4 +1,4 @@
-.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-tf012e2 benchmark-tf012e3 benchmark-tf012e4 benchmark-tf012e5 benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
+.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-tf012e2 benchmark-tf012e3 benchmark-tf012e4 benchmark-tf012e5 benchmark-tf012e6 benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
 
 build:
 	docker compose build
@@ -131,6 +131,9 @@ benchmark-tf012e4:
 
 benchmark-tf012e5:
 	python3 -m benchmarks.e5 --project taskforge-tf012-e5-retry $(if $(filter 1 true TRUE,$(DRY_RUN)),--dry-run,)
+
+benchmark-tf012e6:
+	python3 -m benchmarks.e6 --project taskforge-tf012-e6-recovery $(if $(filter 1 true TRUE,$(DRY_RUN)),--dry-run,)
 
 benchmark-dev:
 	@printf 'UNPUBLISHABLE development run: dirty source is permitted and recorded\n'
