@@ -74,8 +74,14 @@ class TaskAttempt:
     attempt_number: int
     status: TaskAttemptStatus
     leased_at: datetime
+    queue_entered_at: datetime | None
+    scheduled_at_snapshot: datetime | None
     started_at: datetime | None
     finished_at: datetime | None
+    retry_scheduled_at: datetime | None
+    recovered_lease_expires_at: datetime | None
+    recovered_at: datetime | None
+    recovery_action: str | None
     output: dict[str, Any] | None
     error: str | None
     created_at: datetime
@@ -107,3 +113,26 @@ class Worker:
     updated_at: datetime
     liveness: WorkerLiveness
     heartbeat_age_seconds: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExceptionalAttempt:
+    task_id: UUID
+    task_type: str
+    attempt_number: int
+    status: TaskAttemptStatus
+    worker_id: UUID
+    error: str | None
+    retry_scheduled_at: datetime | None
+    recovered_at: datetime | None
+    recovery_action: str | None
+    occurred_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OverviewSnapshot:
+    task_counts: dict[TaskStatus, int]
+    worker_counts: dict[WorkerLiveness, int]
+    recent_tasks: list[Task]
+    recent_exceptions: list[ExceptionalAttempt]
+    observed_at: datetime

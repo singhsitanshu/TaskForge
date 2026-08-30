@@ -55,6 +55,7 @@ test:
 	cd api && python -m pytest
 	cd scheduler && go test ./...
 	cd worker && go test ./...
+	cd web && npm test
 	cd web && npm run build
 	$(MAKE) test-integration
 	$(MAKE) test-claims

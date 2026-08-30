@@ -9,11 +9,12 @@ from fastapi import FastAPI, Request, Response, status
 from prometheus_client import CONTENT_TYPE_LATEST
 
 from app.config import HeartbeatSettings
+from app.console_routes import router as console_router
 from app.database import create_pool
 from app.metrics import ApiMetrics
 from app.repositories import PostgresTaskRepository, PostgresWorkerRepository
 from app.routes import router as tasks_router
-from app.services import TaskService, WorkerService
+from app.services import ConsoleService, TaskService, WorkerService
 from app.worker_routes import router as workers_router
 
 
@@ -34,12 +35,19 @@ def create_app(
         pool = create_pool(resolved_database_url, database_connection_kwargs)
         await pool.open(wait=True)
         application.state.pool = pool
+        task_repository = PostgresTaskRepository(pool)
+        worker_repository = PostgresWorkerRepository(pool)
         application.state.task_service = TaskService(
-            PostgresTaskRepository(pool),
+            task_repository,
             metrics,
         )
         application.state.worker_service = WorkerService(
-            PostgresWorkerRepository(pool),
+            worker_repository,
+            resolved_heartbeat_settings,
+        )
+        application.state.console_service = ConsoleService(
+            task_repository,
+            worker_repository,
             resolved_heartbeat_settings,
         )
         try:
@@ -54,6 +62,7 @@ def create_app(
     )
     application.include_router(tasks_router)
     application.include_router(workers_router)
+    application.include_router(console_router)
 
     @application.middleware("http")
     async def observe_http_requests(request: Request, call_next) -> Response:

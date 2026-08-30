@@ -4,7 +4,16 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from app.domain import NewTask, Task, TaskAttempt, TaskAttemptStatus, TaskStatus, Worker
+from app.domain import (
+    ExceptionalAttempt,
+    NewTask,
+    OverviewSnapshot,
+    Task,
+    TaskAttempt,
+    TaskAttemptStatus,
+    TaskStatus,
+    Worker,
+)
 from app.liveness import WorkerLiveness
 
 QueueName = Annotated[
@@ -80,6 +89,7 @@ class TaskListResponse(BaseModel):
     items: list[TaskResponse]
     limit: int
     offset: int
+    total: int
 
 
 class TaskAttemptResponse(BaseModel):
@@ -91,8 +101,14 @@ class TaskAttemptResponse(BaseModel):
     attempt_number: int
     status: TaskAttemptStatus
     leased_at: datetime
+    queue_entered_at: datetime | None
+    scheduled_at_snapshot: datetime | None
     started_at: datetime | None
     finished_at: datetime | None
+    retry_scheduled_at: datetime | None
+    recovered_lease_expires_at: datetime | None
+    recovered_at: datetime | None
+    recovery_action: str | None
     output: dict[str, Any] | None
     error: str | None
     created_at: datetime
@@ -130,3 +146,44 @@ class WorkerListResponse(BaseModel):
     items: list[WorkerResponse]
     limit: int
     offset: int
+    total: int
+
+
+class ExceptionalAttemptResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    task_id: UUID
+    task_type: str
+    attempt_number: int
+    status: TaskAttemptStatus
+    worker_id: UUID
+    error: str | None
+    retry_scheduled_at: datetime | None
+    recovered_at: datetime | None
+    recovery_action: str | None
+    occurred_at: datetime
+
+    @classmethod
+    def from_domain(cls, attempt: ExceptionalAttempt) -> "ExceptionalAttemptResponse":
+        return cls.model_validate(attempt)
+
+
+class OverviewResponse(BaseModel):
+    task_counts: dict[TaskStatus, int]
+    worker_counts: dict[WorkerLiveness, int]
+    recent_tasks: list[TaskResponse]
+    recent_exceptions: list[ExceptionalAttemptResponse]
+    observed_at: datetime
+
+    @classmethod
+    def from_domain(cls, snapshot: OverviewSnapshot) -> "OverviewResponse":
+        return cls(
+            task_counts=snapshot.task_counts,
+            worker_counts=snapshot.worker_counts,
+            recent_tasks=[TaskResponse.from_domain(task) for task in snapshot.recent_tasks],
+            recent_exceptions=[
+                ExceptionalAttemptResponse.from_domain(attempt)
+                for attempt in snapshot.recent_exceptions
+            ],
+            observed_at=snapshot.observed_at,
+        )

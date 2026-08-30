@@ -107,7 +107,16 @@ def test_submit_get_list_and_cancel(
     listing = list_response.json()
     assert listing["limit"] == 10
     assert listing["offset"] == 0
+    assert listing["total"] >= 1
     assert task_id in {item["id"] for item in listing["items"]}
+
+    handler_listing = api_client.get(
+        "/tasks",
+        params={"task_type": "email.send", "limit": 10, "offset": 0},
+    )
+    assert handler_listing.status_code == 200
+    assert handler_listing.json()["total"] >= 1
+    assert {item["task_type"] for item in handler_listing.json()["items"]} == {"email.send"}
 
     with database_connection(database_schema) as connection:
         attempts_before = connection.execute(
@@ -380,6 +389,10 @@ def test_attempt_history_is_ordered_and_exposes_abandonment(
     assert attempts[0]["worker_id"] == str(worker_a)
     assert attempts[0]["error"] == "lease_expired"
     assert attempts[0]["finished_at"] is not None
+    assert attempts[0]["recovery_action"] is None
+    assert "queue_entered_at" in attempts[0]
+    assert "retry_scheduled_at" in attempts[0]
+    assert "recovered_at" in attempts[0]
     assert attempts[1]["worker_id"] == str(worker_b)
     assert "lease_token" not in attempts[0]
 
@@ -403,3 +416,4 @@ def test_submission_validation(
 def test_list_validation(api_client: TestClient) -> None:
     assert api_client.get("/tasks", params={"status": "UNKNOWN"}).status_code == 422
     assert api_client.get("/tasks", params={"limit": 101}).status_code == 422
+    assert api_client.get("/tasks", params={"task_type": ""}).status_code == 422

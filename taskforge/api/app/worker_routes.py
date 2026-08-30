@@ -37,9 +37,10 @@ async def list_workers(
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> WorkerListResponse:
-    workers = await service.list(limit=limit, offset=offset)
+    workers, total = await service.list(limit=limit, offset=offset)
     return WorkerListResponse(
         items=[WorkerResponse.from_domain(worker) for worker in workers],
         limit=limit,
         offset=offset,
+        total=total,
     )

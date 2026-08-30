@@ -28,10 +28,11 @@ The fingerprint covers `task_type`, canonicalized `payload`, `priority`, `max_at
 
 ## List tasks
 
-`GET /tasks` returns an object with `items`, `limit`, and `offset`. Optional query parameters:
+`GET /tasks` returns an object with `items`, `limit`, `offset`, and the filtered `total`. Optional query parameters:
 
 - `status`: one of the defined task statuses.
 - `queue`: exact queue match.
+- `task_type`: exact handler/task-type match.
 - `limit`: 1–100, default 50.
 - `offset`: non-negative, default 0.
 
@@ -51,13 +52,13 @@ Task responses expose `claimed_by_worker_id` and `lease_expires_at`. Both are no
 
 `GET /tasks/{id}/attempts` returns `{ "items": [...] }` with durable attempt history ordered by `attempt_number` ascending. Unknown tasks return `404`; a task with no attempts returns an empty list.
 
-Each item includes `id`, `task_id`, `worker_id`, `attempt_number`, `status`, `leased_at`, `started_at`, `finished_at`, `output`, `error`, `created_at`, and `updated_at`. `FAILED` records a handler error; `ABANDONED` identifies lease-loss recovery with `lease_expired`. Internal ownership secrets are not exposed.
+Each item includes `id`, `task_id`, `worker_id`, `attempt_number`, `status`, `leased_at`, `started_at`, `finished_at`, `output`, `error`, `created_at`, and `updated_at`. It also exposes existing immutable timing evidence where available: `queue_entered_at`, `scheduled_at_snapshot`, `retry_scheduled_at`, `recovered_lease_expires_at`, `recovered_at`, and `recovery_action`. Legacy attempts may have null evidence fields. `FAILED` records a handler error; `ABANDONED` identifies lease-loss recovery with `lease_expired`. Internal ownership secrets are not exposed.
 
 Submission replay returns the original task, so this endpoint naturally returns that task's complete attempt history. Submission idempotency does not guarantee exactly-once handler execution or external side effects.
 
 ## List workers
 
-`GET /workers` returns an object with `items`, `limit`, and `offset`. Workers are ordered by registration time and ID, newest first. Each item includes:
+`GET /workers` returns an object with `items`, `limit`, `offset`, and `total`. Workers are ordered by registration time and ID, newest first. Each item includes:
 
 - `id`, `instance_id`, and human-readable `name`.
 - Administrative `enabled` state and non-sensitive `metadata`.
@@ -68,3 +69,18 @@ Submission replay returns the original task, so this endpoint naturally returns 
 ## Get a worker
 
 `GET /workers/{worker_id}` returns the same worker representation or `404`. Liveness is derived when the request is served; it is not persisted as a status column.
+
+## Operations overview
+
+`GET /overview?recent_limit=8` returns the bounded read model used by the web console. The limit
+must be between 1 and 25. The response contains:
+
+- exact PostgreSQL counts for every supported task status;
+- exact `ACTIVE`, `STALE`, and `DEAD` worker counts derived from the configured backend heartbeat
+  thresholds and PostgreSQL time;
+- the newest bounded task records;
+- the newest bounded `FAILED` and `ABANDONED` attempts, including retry/recovery evidence;
+- the snapshot observation timestamp.
+
+This endpoint is read-only. It performs aggregate and bounded queries and does not change task,
+worker, retry, lease, or recovery state.

@@ -36,6 +36,7 @@ COPY --from=scheduler-build /out/taskforge-scheduler /usr/local/bin/taskforge-sc
 COPY migrations ./migrations
 COPY tests/test_migrations.py ./tests/test_migrations.py
 COPY tests/test_task_api.py ./tests/test_task_api.py
+COPY tests/test_console_api.py ./tests/test_console_api.py
 COPY tests/test_idempotency_api.py ./tests/test_idempotency_api.py
 COPY tests/test_worker_e2e.py ./tests/test_worker_e2e.py
 COPY tests/test_claim_races.py ./tests/test_claim_races.py

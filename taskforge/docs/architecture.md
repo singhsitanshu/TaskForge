@@ -8,7 +8,11 @@ TaskForge currently provides durable idempotent task submission, predefined Go w
 
 ### Web (`web`)
 
-The React/TypeScript application is the browser-facing interface. It is built as static assets and served by Nginx. It communicates only through the API and never connects directly to PostgreSQL, Redis, the scheduler, or workers.
+The React/TypeScript TaskForge Operations Console is built as static assets and served by Nginx.
+It communicates only through the FastAPI service, using the same-origin `/api` reverse proxy, and
+never connects directly to PostgreSQL, Redis, the scheduler, or workers. It presents current
+application state and durable lifecycle history; Grafana remains responsible for historical
+metrics and Prometheus for raw metric inspection.
 
 ### API (`api`)
 
@@ -119,7 +123,7 @@ Submission idempotency guarantees one durable logical task for a valid key, not 
     api/          FastAPI control plane
     scheduler/    Go lifecycle-maintenance service
     worker/       Go execution service
-    web/          React/TypeScript frontend
+    web/          React/TypeScript operations console
     migrations/   PostgreSQL migrations
     monitoring/   Prometheus configuration and provisioned Grafana dashboard
     tests/        Cross-service and integration tests

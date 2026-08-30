@@ -102,6 +102,7 @@ def test_worker_list_and_detail_derive_liveness_from_database_time(
     listing = response.json()
     assert listing["limit"] == 50
     assert listing["offset"] == 0
+    assert listing["total"] == 3
     by_name = {item["name"]: item for item in listing["items"]}
     assert by_name["active"]["liveness"] == "ACTIVE"
     assert by_name["stale"]["liveness"] == "STALE"

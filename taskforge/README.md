@@ -9,7 +9,7 @@ TaskForge is a service-oriented task orchestration platform. The current milesto
 | `api` | Python / FastAPI | 8000 | Task control plane and worker-liveness visibility |
 | `scheduler` | Go | internal | Recovers expired leases and promotes due retries transactionally |
 | `worker` | Go | internal | Polls PostgreSQL, executes registered handlers, and heartbeats independently |
-| `web` | React / TypeScript | 3000 | Browser interface |
+| `web` | React / TypeScript | 3000 | TaskForge Operations Console |
 | `postgres` | PostgreSQL | 5432 | Durable application state |
 | `redis` | Redis | 6379 | Future queueing and short-lived coordination |
 | `prometheus` | Prometheus | 9090 | Scrapes all API, worker, and scheduler replicas |
@@ -23,6 +23,11 @@ TaskForge is a service-oriented task orchestration platform. The current milesto
     make health
 
 Open the web app at <http://localhost:3000>, API documentation at <http://localhost:8000/docs>, Prometheus at <http://localhost:9090>, and Grafana at <http://localhost:3001>.
+
+The Operations Console provides real PostgreSQL-backed task counts, bounded task exploration,
+task submission, durable attempt timelines, authoritative worker liveness, and links to the
+provisioned observability tools. Its primary routes are `/`, `/tasks`, `/tasks/:id`, `/submit`,
+`/workers`, and `/system`. Runtime views never substitute mock data for unavailable services.
 
 ## Developer commands
 
@@ -43,3 +48,4 @@ Open the web app at <http://localhost:3000>, API documentation at <http://localh
 See [docs/architecture.md](docs/architecture.md) for service boundaries and communication paths.
 See [docs/tf-010.md](docs/tf-010.md) for the idempotent-submission contract and execution guarantee boundary.
 See [docs/tf-011.md](docs/tf-011.md) for metrics, cardinality, latency, and health/readiness contracts.
+See [docs/tf-013.md](docs/tf-013.md) for console routes, API configuration, and refresh behavior.

@@ -103,12 +103,14 @@ async def list_tasks(
     service: TaskServiceDependency,
     task_status: Annotated[TaskStatus | None, Query(alias="status")] = None,
     queue: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    task_type: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> TaskListResponse:
-    tasks = await service.list(
+    tasks, total = await service.list(
         status=task_status,
         queue=queue,
+        task_type=task_type,
         limit=limit,
         offset=offset,
     )
@@ -116,6 +118,7 @@ async def list_tasks(
         items=[TaskResponse.from_domain(task) for task in tasks],
         limit=limit,
         offset=offset,
+        total=total,
     )
 
 

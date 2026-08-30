@@ -1,11 +1,14 @@
+import asyncio
 import logging
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
 from app.config import HeartbeatSettings
 from app.domain import (
     NewTask,
+    OverviewSnapshot,
     SubmitTaskResult,
     Task,
     TaskAttempt,
@@ -111,14 +114,23 @@ class TaskService:
         *,
         status: TaskStatus | None,
         queue: str | None,
+        task_type: str | None,
         limit: int,
         offset: int,
-    ) -> Sequence[Task]:
-        return await self._repository.list(
-            status=status,
-            queue=queue,
-            limit=limit,
-            offset=offset,
+    ) -> tuple[Sequence[Task], int]:
+        return await asyncio.gather(
+            self._repository.list(
+                status=status,
+                queue=queue,
+                task_type=task_type,
+                limit=limit,
+                offset=offset,
+            ),
+            self._repository.count(
+                status=status,
+                queue=queue,
+                task_type=task_type,
+            ),
         )
 
     async def cancel(self, task_id: UUID) -> Task:
@@ -162,9 +174,12 @@ class WorkerService:
             raise WorkerNotFoundError
         return self._with_liveness(worker)
 
-    async def list(self, *, limit: int, offset: int) -> Sequence[Worker]:
-        workers = await self._repository.list(limit=limit, offset=offset)
-        return [self._with_liveness(worker) for worker in workers]
+    async def list(self, *, limit: int, offset: int) -> tuple[list[Worker], int]:
+        workers, total = await asyncio.gather(
+            self._repository.list(limit=limit, offset=offset),
+            self._repository.count(),
+        )
+        return [self._with_liveness(worker) for worker in workers], total
 
     def _with_liveness(self, worker: WorkerRecord) -> Worker:
         liveness, heartbeat_age_seconds = classify_worker_liveness(
@@ -186,7 +201,44 @@ class WorkerService:
         )
 
 
+class ConsoleService:
+    def __init__(
+        self,
+        task_repository: TaskRepository,
+        worker_repository: WorkerRepository,
+        heartbeat_settings: HeartbeatSettings,
+    ) -> None:
+        self._task_repository = task_repository
+        self._worker_repository = worker_repository
+        self._heartbeat_settings = heartbeat_settings
+
+    async def overview(self, *, recent_limit: int) -> OverviewSnapshot:
+        task_counts, worker_counts, recent_tasks, recent_exceptions = await asyncio.gather(
+            self._task_repository.count_by_status(),
+            self._worker_repository.count_by_liveness(
+                stale_after_seconds=self._heartbeat_settings.stale_after.total_seconds(),
+                dead_after_seconds=self._heartbeat_settings.dead_after.total_seconds(),
+            ),
+            self._task_repository.list(
+                status=None,
+                queue=None,
+                task_type=None,
+                limit=recent_limit,
+                offset=0,
+            ),
+            self._task_repository.list_recent_exceptions(limit=recent_limit),
+        )
+        return OverviewSnapshot(
+            task_counts=task_counts,
+            worker_counts=worker_counts,
+            recent_tasks=list(recent_tasks),
+            recent_exceptions=list(recent_exceptions),
+            observed_at=datetime.now(UTC),
+        )
+
+
 __all__ = [
+    "ConsoleService",
     "IdempotencyKeyReuseError",
     "TaskConflictError",
     "TaskNotFoundError",
