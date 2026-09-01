@@ -1,0 +1,14 @@
+.env
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+coverage/
+node_modules/
+dist/
+*.test
+benchmarks/results/*
+!benchmarks/results/.gitkeep
+benchmarks/reports/*.md
