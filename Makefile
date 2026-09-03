@@ -1,13 +1,46 @@
-.PHONY: build up down logs health readiness metrics lint format format-check test migrate-up migrate-down test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-tf012e2 benchmark-tf012e3 benchmark-tf012e4 benchmark-tf012e5 benchmark-tf012e6 benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
+.PHONY: help build up down dev-reset logs health readiness wait-ready metrics lint format format-check test migrate-up migrate-down demo demo-data demo-recovery demo-status demo-reset test-demo-unit test-demo-smoke test-demo-recovery test-integration test-claims test-recovery test-retries test-idempotency test-api test-migrations test-worker test-heartbeats test-leases test-observability benchmark-reset benchmark-smoke benchmark-trust-smoke benchmark-release benchmark-e1-noop benchmark-tf012e2 benchmark-tf012e3 benchmark-tf012e4 benchmark-tf012e5 benchmark-tf012e6 benchmark-dev benchmark-scaling benchmark-api benchmark-retry benchmark-recovery benchmark-all benchmark-plots benchmark-report
+
+help:
+	@printf '%s\n' \
+		'TaskForge developer commands' \
+		'' \
+		'Development' \
+		'  make up              Start, migrate, and wait for TaskForge' \
+		'  make down            Stop TaskForge' \
+		'  make wait-ready      Wait for every local service' \
+		'  make logs            Follow service logs' \
+		'  make dev-reset       Reset all local volumes (requires CONFIRM=1)' \
+		'' \
+		'Demo' \
+		'  make demo            Run real normal + retry demonstrations' \
+		'  make demo-data       Populate a bounded representative dataset' \
+		'  make demo-recovery   Demonstrate local worker-crash recovery' \
+		'  make demo-status     Show prerequisites and local URLs' \
+		'  make demo-reset      Explain the safe demo reset path' \
+		'' \
+		'Testing' \
+		'  make test-demo-unit  Test demo logic without Docker' \
+		'  make test-demo-smoke Run normal/retry against the local stack' \
+		'  make test            Run the complete test suite' \
+		'' \
+		'Benchmarking' \
+		'  make benchmark-smoke Run the trusted smoke benchmark'
 
 build:
 	docker compose build
 
 up:
+	docker compose up -d postgres
+	@./scripts/migrate.sh up
 	docker compose up --build -d
+	@$(MAKE) wait-ready
 
 down:
 	docker compose down
+
+dev-reset:
+	@test "$(CONFIRM)" = "1" || (printf 'This removes every TaskForge local development volume.\nRun: make dev-reset CONFIRM=1\n' && exit 2)
+	docker compose down --volumes --remove-orphans
 
 logs:
 	docker compose logs -f
@@ -25,6 +58,38 @@ readiness:
 	@docker compose exec -T worker wget --quiet --tries=1 --spider http://127.0.0.1:8080/readyz
 	@printf '\nTaskForge processing services are ready.\n'
 
+wait-ready:
+	@python3 -m scripts.demo.cli wait-ready
+
+demo:
+	@python3 -m scripts.demo.cli demo $(if $(filter 1 true TRUE,$(DEMO_JSON)),--json,)
+
+demo-data:
+	@python3 -m scripts.demo.cli data
+
+demo-recovery:
+	@python3 -m scripts.demo.cli recovery
+
+demo-status:
+	@python3 -m scripts.demo.cli status
+
+demo-reset:
+	@printf '%s\n' \
+		'Demo tasks are durable by design, and TaskForge has no task-deletion API.' \
+		'To reset the complete local development database and all local volumes:' \
+		'' \
+		'    make dev-reset CONFIRM=1' \
+		'    make up'
+
+test-demo-unit:
+	python3 -m unittest discover -s scripts/demo/tests -v
+
+test-demo-smoke:
+	@python3 -m scripts.demo.cli demo --json
+
+test-demo-recovery:
+	@python3 -m scripts.demo.cli recovery
+
 metrics:
 	@curl --fail --silent http://localhost:$${API_PORT:-8000}/metrics >/dev/null
 	@curl --fail --silent http://localhost:$${PROMETHEUS_PORT:-9090}/-/ready >/dev/null
@@ -34,6 +99,7 @@ metrics:
 lint:
 	cd api && python -m ruff check .
 	python -m ruff check benchmarks
+	python -m ruff check scripts
 	cd scheduler && go vet ./...
 	cd worker && go vet ./...
 	cd web && npm run lint
@@ -41,6 +107,7 @@ lint:
 format:
 	cd api && python -m ruff check --fix . && python -m ruff format .
 	python -m ruff check --fix benchmarks && python -m ruff format benchmarks
+	python -m ruff check --fix scripts && python -m ruff format scripts
 	cd scheduler && gofmt -w $$(find . -type f -name '*.go')
 	cd worker && gofmt -w $$(find . -type f -name '*.go')
 	cd web && npm run format
@@ -48,10 +115,12 @@ format:
 format-check:
 	cd api && python -m ruff format --check .
 	python -m ruff format --check benchmarks
+	python -m ruff format --check scripts
 	@files=$$(find scheduler worker -type f -name '*.go' -exec gofmt -l {} +); test -z "$$files" || (printf '%s\n' "$$files" && exit 1)
 	cd web && npm run format:check
 
 test:
+	$(MAKE) test-demo-unit
 	cd api && python -m pytest
 	cd scheduler && go test ./...
 	cd worker && go test ./...

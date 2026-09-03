@@ -10,6 +10,44 @@ The system has been validated under multi-worker contention, retry storms, hard 
 
 ---
 
+## Try TaskForge in 5 Minutes
+
+Requirements: Docker with Compose, Make, and Python 3.11 or newer.
+
+```bash
+git clone https://github.com/singhsitanshu/TaskForge.git
+cd TaskForge
+cp .env.example .env
+make up
+make demo
+```
+
+`make up` starts PostgreSQL first, applies every pending migration, starts the complete stack,
+and waits for bounded readiness checks. `make demo` then submits real tasks through the public
+API and verifies both a one-attempt success and a durable `FAILED → SUCCEEDED` retry history.
+
+Open:
+
+- Web Console — <http://localhost:3000>
+- API Docs — <http://localhost:8000/docs>
+- Grafana — <http://localhost:3001> (`admin` / `taskforge` with the example environment)
+- Prometheus — <http://localhost:9090>
+
+Want a fuller console for screenshots or exploration? Run `make demo-data`. Local ports and
+Grafana credentials come from `.env`; `make demo-status` always prints the resolved URLs.
+
+## Project Tour
+
+If you only have a few minutes:
+
+1. Run `make demo` and open either direct task-detail link it prints.
+2. Inspect the retry task's durable attempt timeline in the Web Console.
+3. Run `make demo-recovery` to kill the actual local owner of a running attempt.
+4. Confirm the resulting `ABANDONED → SUCCEEDED` history.
+5. Open Grafana to inspect the real operational metrics, then read [Architecture](#architecture).
+
+---
+
 ## Highlights
 
 - **Atomic distributed task claiming** with PostgreSQL `FOR UPDATE SKIP LOCKED`
@@ -144,8 +182,6 @@ Example:
   "max_attempts": 3
 }
 ```
-
-> **TODO:** Replace this example with the exact current API request schema after verifying it against the implemented endpoint.
 
 Once accepted, the task is durably persisted in PostgreSQL.
 
@@ -475,11 +511,9 @@ Validated recovery tests have run multiple schedulers concurrently with zero dup
 
 # Web Console
 
-> **TF-013 is currently overhauling the TaskForge frontend.**
+The web console provides application-level operational visibility without replacing Grafana.
 
-The web console is intended to provide application-level operational visibility without replacing Grafana.
-
-Planned/current console areas include:
+Console areas include:
 
 - Overview
 - Tasks
@@ -493,7 +527,7 @@ Planned/current console areas include:
 
 ### Operations Overview
 
-The finished dashboard will surface real TaskForge state such as:
+The dashboard surfaces real TaskForge state such as:
 
 - queued tasks
 - running tasks
@@ -509,7 +543,7 @@ Tasks can be inspected without querying PostgreSQL manually.
 
 ### Attempt Timeline
 
-The UI will expose durable histories such as:
+The UI exposes durable histories such as:
 
 ```text
 FAILED → retry → SUCCEEDED
@@ -520,8 +554,6 @@ and:
 ```text
 ABANDONED → replacement SUCCEEDED
 ```
-
-> **TODO:** Replace this section with screenshots and exact page descriptions after TF-013 is complete.
 
 ---
 
@@ -925,7 +957,8 @@ You will need:
 - Docker Compose
 - Make
 
-Depending on the development workflow, local Go/Python/Node installations may also be useful.
+Python 3.11 or newer is used by the dependency-free demo tooling. Local Go and Node installations
+are only needed when developing or testing those services outside Docker.
 
 ---
 
@@ -935,10 +968,6 @@ Depending on the development workflow, local Go/Python/Node installations may al
 git clone https://github.com/singhsitanshu/TaskForge.git
 cd TaskForge
 ```
-
-> **TODO:** Verify repository capitalization/path.
-
----
 
 ## Configure Environment
 
@@ -954,34 +983,22 @@ Do not commit secrets.
 
 ## Start TaskForge
 
-> **TODO:** Verify the exact preferred startup command.
-
-Likely one of:
-
-```bash
-docker compose up --build
-```
-
-or:
-
 ```bash
 make up
 ```
 
-or the repository's existing development target.
+This command starts PostgreSQL, applies pending migrations, builds and starts the remaining
+services, then waits up to three minutes for the complete stack. It exits nonzero and names any
+service that failed readiness.
 
 ---
 
 ## Run Migrations
 
-TaskForge includes versioned transactional migrations.
-
-> **TODO:** Confirm preferred command.
-
-Potentially:
+`make up` runs migrations automatically. To apply them independently:
 
 ```bash
-make migrate
+make migrate-up
 ```
 
 Migrations:
@@ -996,16 +1013,16 @@ Migrations:
 
 # Local Services
 
-> **TODO:** Verify these values from the current Compose configuration before publishing.
-
 | Service | URL |
 |---|---|
-| TaskForge Web | `http://localhost:????` |
-| API | `http://localhost:????` |
-| Grafana | `http://localhost:3000` |
+| TaskForge Web | `http://localhost:3000` |
+| API | `http://localhost:8000` |
+| API Docs | `http://localhost:8000/docs` |
+| Grafana | `http://localhost:3001` |
 | Prometheus | `http://localhost:9090` |
 
-Do not publish guessed port numbers.
+These are the `.env.example` defaults. Change the corresponding port in `.env` if needed, and use
+`make demo-status` to print the resolved URLs and readiness of every local service.
 
 ---
 
@@ -1014,7 +1031,7 @@ Do not publish guessed port numbers.
 Once the API is running:
 
 ```bash
-curl -X POST http://localhost:<API_PORT>/tasks \
+curl -X POST http://localhost:8000/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "task_type": "test.sleep",
@@ -1026,21 +1043,16 @@ curl -X POST http://localhost:<API_PORT>/tasks \
   }'
 ```
 
-> **TODO:** Replace with the exact current request schema.
-
 The API returns a task identifier that can then be inspected through either the API or TaskForge Web Console.
 
 ---
 
 # Inspect a Task
 
-Conceptually:
-
 ```bash
-curl http://localhost:<API_PORT>/tasks/<TASK_ID>
+curl http://localhost:8000/tasks/<TASK_ID>
+curl http://localhost:8000/tasks/<TASK_ID>/attempts
 ```
-
-> **TODO:** Verify exact endpoint and response format.
 
 ---
 
@@ -1048,10 +1060,8 @@ curl http://localhost:<API_PORT>/tasks/<TASK_ID>
 
 TaskForge exposes worker information through API endpoints.
 
-Conceptually:
-
 ```bash
-curl http://localhost:<API_PORT>/workers
+curl http://localhost:8000/workers
 ```
 
 Worker responses include information such as:
@@ -1063,7 +1073,22 @@ Worker responses include information such as:
 - last heartbeat;
 - liveness state.
 
-> **TODO:** Confirm exact current endpoint fields.
+
+## Demo Commands
+
+Run `make help` for the complete command index. The reviewer-oriented commands are:
+
+| Command | Purpose |
+|---|---|
+| `make demo` | Submit and verify a normal task plus a fail-once retry task |
+| `make demo-data` | Create 16 bounded, representative real task histories |
+| `make demo-recovery` | Kill the exact owner worker and verify lease recovery |
+| `make demo-status` | Report service readiness, active workers, and resolved URLs |
+| `make demo-reset` | Explain the guarded full local reset path |
+
+Every demo run uses unique `tf014-*` idempotency keys, so rerunning a command creates a new named
+dataset without accidental key conflicts. TaskForge intentionally has no task-deletion API. See
+[the demo guide](docs/demo.md) for recovery safety, reset behavior, and troubleshooting.
 
 ---
 
@@ -1107,14 +1132,12 @@ TaskForge/
 │   └── ...
 │
 ├── scripts/
+│   ├── demo/
+│   └── migrate.sh
 ├── tests/
 ├── docker-compose.yml
 └── Makefile
 ```
-
-> **TODO:** Update this tree to exactly match the final repository after TF-013.
-
----
 
 # Testing
 
@@ -1149,8 +1172,6 @@ Coverage includes:
 
 ## Standard Test Suite
 
-> **TODO:** Verify exact command.
-
 ```bash
 make test
 ```
@@ -1171,17 +1192,13 @@ Race-enabled testing has been used for worker and scheduler concurrency paths.
 
 ## Frontend
 
-> **TODO after TF-013:** Insert exact commands.
-
-For example:
-
 ```bash
+cd web
+npm ci
 npm test
 npm run lint
 npm run build
 ```
-
-Use the actual package manager/scripts.
 
 ---
 

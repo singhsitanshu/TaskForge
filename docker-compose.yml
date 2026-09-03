@@ -110,6 +110,9 @@ services:
   web:
     build:
       context: ./web
+      args:
+        VITE_GRAFANA_PORT: ${GRAFANA_PORT:-3001}
+        VITE_PROMETHEUS_PORT: ${PROMETHEUS_PORT:-9090}
     ports:
       - "${WEB_PORT:-3000}:8080"
     depends_on:

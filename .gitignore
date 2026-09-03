@@ -12,3 +12,4 @@ dist/
 benchmarks/results/*
 !benchmarks/results/.gitkeep
 benchmarks/reports/*.md
+.demo/

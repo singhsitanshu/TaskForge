@@ -144,6 +144,9 @@ export function observabilityUrl(kind: "grafana" | "prometheus"): string {
       ? import.meta.env.VITE_GRAFANA_URL
       : import.meta.env.VITE_PROMETHEUS_URL;
   if (configured) return configured;
-  const port = kind === "grafana" ? "3001" : "9090";
+  const port =
+    kind === "grafana"
+      ? import.meta.env.VITE_GRAFANA_PORT || "3001"
+      : import.meta.env.VITE_PROMETHEUS_PORT || "9090";
   return `${window.location.protocol}//${window.location.hostname}:${port}`;
 }
